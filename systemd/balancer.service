@@ -1,0 +1,15 @@
+[Unit]
+Description=comp4703 control
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/puma/myapp
+Environment=GEM_HOME=/var/www/puma/myapp/gems/2.7.0
+ExecStart=/usr/local/bin/bundle exec ruby /var/www/puma/myapp/balancer.rb
+TimeoutSec=15
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

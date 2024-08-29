@@ -1,0 +1,15 @@
+[Unit]
+Description=Puma Rails Server
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/puma/myapp
+Environment=GEM_HOME=/var/www/puma/myapp/gems/2.7.0
+ExecStart=/usr/local/bin/bundle exec puma -C /var/www/puma/myapp/config/puma.rb /var/www/puma/myapp/config/config.ru
+TimeoutSec=15
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
