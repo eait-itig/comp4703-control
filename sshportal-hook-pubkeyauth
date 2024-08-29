@@ -1,0 +1,14 @@
+#!/bin/bash
+set -e
+username="$1"
+pubkey="$2"
+
+export SSH_AUTH_SOCK=/run/zone-auth-agent-sshportal.sock
+export SDC_KEY_ID=$(ssh-add -l | head -1 | awk '{print $2}')
+export SDC_ACCOUNT=$(zonename)
+
+if sdc-curl -s -d "${pubkey}" -XPOST "http://localhost:443/control/assign-zone/${username}" | grep -v '^ok:'; then
+  exit 1
+fi
+
+exit 0
