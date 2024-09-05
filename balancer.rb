@@ -8,6 +8,7 @@ require 'ssh_data'
 require 'logger'
 require 'etc'
 require 'digest'
+require 'erb'
 require './utils'
 
 ENV['SSH_AUTH_SOCK'] = '/run/zone-auth-agent.sock'
@@ -63,6 +64,7 @@ def update_zone_keys
     JSON.parse(l, :symbolize_names => true) }
   zones = []
   vms.each do |vm|
+    next unless vm[:nics]
     vpnnic = vm[:nics].find { |n| n[:network] == $vpnnet }
     next unless vpnnic
     next unless vm[:auth_key]
@@ -92,6 +94,24 @@ def update_zone_keys
   $last_zone_hash = zone_hash
 end
 
+class TplParams
+  def initialize(token)
+    @token = token
+    @xusers = get_config(:xusers).split
+    @default_keyid = $default_keyid
+    @default_pubkey = $default_pubkey
+    @myaddr = $myaddr
+  end
+  def get_binding
+    binding
+  end
+  def heredoc(fname)
+    tpl = ERB.new(File.read("#{__dir__}/#{fname}"), trim_mode: '-')
+    delim = SecureRandom.hex(4).upcase
+    "<<\"#{delim}\"\n#{tpl.result(get_binding)}\n#{delim}\n"
+  end
+end
+
 def provision
   $log.info('provisioning a new instance')
   token = SecureRandom.base64(18).gsub(/[^a-zA-Z0-9]/, '')
@@ -107,9 +127,9 @@ def provision
 
   res = $ec2.describe_subnets(:filters => [{name: 'vpc-id', values: [vpc.vpc_id]}])
   subnet = res.subnets.filter do |s|
-    not s.tags.find do |t|
+    s.tags.find do |t|
       t.key == 'Name' and (
-        t.value.include?('public') or t.value.include?('se-2b')
+        t.value.include?('se-2a') and not t.value.include?('public')
       )
     end
   end.shuffle.first
@@ -117,252 +137,9 @@ def provision
   res = $ec2.describe_key_pairs(key_names: [$ec2keyname])
   key = res.key_pairs.first
 
-  xusers = get_config(:xusers).split
-
-  script = <<EOS
-#!/bin/bash
-set -ex
-log=/var/log/userdata-script
-touch ${log}
-chmod 0600 ${log}
-exec >>${log} 2>&1
-
-# stop background upgrades
-systemctl stop unattended-upgrades.service
-systemctl stop apt-daily-upgrade.timer
-systemctl stop apt-daily.timer
-
-# stop docker etc
-for x in docker.service containerd.service snapd.service docker.socket snapd.socket; do
-  systemctl stop ${x}
-  systemctl disable ${x}
-done
-
-# xusers
-groupadd xusers
-for user in #{xusers.join(' ')}; do
-  useradd -g xusers -s /bin/bash -m ${user}
-  mkdir -p /home/${user}/.ssh
-  curl -o /home/${user}/.ssh/authorized_keys https://api.uqcloud.net/sshkeys/none/${user}
-done
-echo "%xusers ALL=(ALL) NOPASSWD: ALL" | tee -a /etc/sudoers
-
-# delete the default ubuntu user
-userdel -fr ubuntu
-
-# basic packages
-apt-get update
-#apt-get upgrade -y
-apt-get install -y nodejs npm diod munge ruby cachefilesd
-npm install -g sshpk
-
-# npm refuses to install from git+https now
-cd /usr/local/lib
-git clone https://github.com/eait-itig/node-smartdc-auth
-cd node-smartdc-auth
-npm install
-npm install -g .
-chmod -R a+rX /usr/local/lib/node-smartdc-auth
-
-# set up auth key
-mkdir -p /var/lib/auth-keys/keys
-chmod 0700 /var/lib/auth-keys/keys
-ssh-keygen -t ecdsa -b 256 -P '' -C $(hostname) -f /var/lib/auth-keys/keys/default
-mkdir -p /var/lib/auth-keys/sockets
-curl -T /var/lib/auth-keys/keys/default.pub http://#{$myaddr}:443/worker/provision/#{token}
-
-cat >/etc/systemd/system/auth-agent.service <<EOF
-[Unit]
-Description=ssh-agent for auth to control system
-After=network.target
-
-[Service]
-User=root
-Environment=SSH_AUTH_SOCK=/var/lib/auth-keys/sockets/default
-Type=forking
-ExecStart=/usr/bin/ssh-agent -a /var/lib/auth-keys/sockets/default
-PermissionsStartOnly=true
-ExecStartPost=/usr/bin/ssh-add /var/lib/auth-keys/keys/default
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable auth-agent
-systemctl start auth-agent
-
-KEYID=$(ssh-keygen -l -f /var/lib/auth-keys/keys/default.pub | awk '{print $2}')
-
-echo 'export SSH_AUTH_SOCK=/var/lib/auth-keys/sockets/default' >/etc/profile.d/authkeys.sh
-echo "export SDC_KEY_ID=${KEYID}" >>/etc/profile.d/authkeys.sh
-echo "export SDC_ACCOUNT=$(hostname)" >>/etc/profile.d/authkeys.sh
-source /etc/profile.d/authkeys.sh
-
-# conda env
-mkdir /opt/dlami/nvme/conda
-mkdir /conda
-mount --bind /opt/dlami/nvme/conda /conda
-
-#curl https://stluc.manta.uqcloud.net/comp4703/public/conda2.tar.gz | tar -C/ -zxf -
-curl https://uq-comp4703.s3.ap-southeast-2.amazonaws.com/conda2.tar.gz | tar -C/ -zxf -
-#curl -o /tmp/conda-install.sh https://repo.anaconda.com/miniconda/Miniconda3-py38_23.5.1-0-Linux-x86_64.sh
-#bash /tmp/conda-install.sh -b -p -u /conda
-#rm -f /tmp/conda-install.sh
-#/conda/bin/conda install -y python=3.8
-#/conda/bin/conda update -y conda
-#/conda/bin/conda install -y --freeze-installed ipython matplotlib scipy
-#/conda/bin/conda install -y --freeze-installed pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia
-#/conda/bin/conda install -y --freeze-installed numpy pandas seaborn scikit-learn nltk spacy transformers datasets umap-learn gensim  clean-text markdownify dataclassy gguf html5lib humanize jsons lxml nbconvert sentencepiece protobuf einops conllu torchmetrics conda-forge::pycocotools pytest elasticsearch streamlit rouge-score fire gitpython jiwer evaluate pillow sacrebleu rich
-#/conda/bin/pip install -U librosa stanza albumentations colabtools wikitextparser warcio tensorflow_datasets timm subword-nmt seqeval elasticsearch tensorboard mteb
-
-# set up the login user
-groupadd -g 1000 comp4703
-useradd -u 1000 -g comp4703 -G plugdev,video -s /bin/bash -m comp4703
-mkdir -p /home/comp4703/.ssh
-echo '#{$default_pubkey}' >/home/comp4703/.ssh/authorized_keys
-
-chown -R comp4703 /conda
-
-cat >>/usr/local/sbin/pam-session-setup <<EOF
-#!/usr/bin/env ruby
-require 'json'
-require 'base64'
-require 'logger'
-require 'open3'
-
-User = ENV['PAM_USER']
-Action = ENV['PAM_TYPE']
-
-LOCK_FILE = '/run/pam-session-setup.lock'
-LOG_FILE = '/var/log/pam-session-setup.log'
-
-exit 0 if %w{root #{xusers.join(' ')}}.include?(User)
-exit 0 unless %w{open_session}.include?(Action)
-
-def sh(cmd, input = nil)
-    $log.info("CMD: \#{cmd}")
-    $logfile.flush
-    Open3.popen3(cmd) do |stdin, stdout, stderr, waiter|
-        stdin.write(input) if not input.nil?
-        stdin.close
-        fds = [stdout, stderr]
-        loop do
-            rs, _, _ = IO.select(fds)
-            rs.each do |fd|
-                if fd.eof?
-                    fds.delete(fd)
-                    next
-                end
-                line = fd.readline.chomp
-                if fd == stdout
-                    $log.info('> ' + line)
-                elsif fd == stderr
-                    $log.error('> ' + line)
-                end
-            end
-            break if fds.empty?
-        end
-        exit_status = waiter.value
-        if exit_status != 0
-            raise Exception.new("Command '\#{cmd}' exited with status \#{exit_status}")
-        end
-    end
-end
-
-$lock = File.open(LOCK_FILE, File::CREAT)
-$lock.flock(File::LOCK_EX)
-
-$logfile = File.open(LOG_FILE, File::WRONLY | File::APPEND | File::CREAT | File::SYNC)
-$log = Logger.new($logfile)
-$log.level = Logger::DEBUG
-
-ENV['PATH'] = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
-ENV['SSH_AUTH_SOCK'] = '/var/lib/auth-keys/sockets/default'
-ENV['SDC_KEY_ID'] = '${KEYID}'
-ENV['SDC_ACCOUNT'] = %x{hostname}.strip
-
-zinfo = JSON.parse(%x{sdc-curl -s http://#{$myaddr}:443/worker/assignment})
-zid = zinfo['zone_id']
-zip = zinfo['zone_ip']
-
-$log.info "setting up worker for \#{zinfo['owner']} (\#{zid})"
-
-if not File.exist?('/etc/zoneid') or File.new('/etc/zoneid').read.strip != zid
-  $log.info 'looks like a change of owner, killing processes'
-  sh("pkill -u \#{User}")
-  sh("pkill -U \#{User}")
-  f = File.new('/etc/munge/munge.key', 'w')
-  f.write Base64.decode64(zinfo['munge_key'])
-  f.close
-  sh("chown munge:munge /etc/munge/munge.key")
-  sh("chmod 0600 /etc/munge/munge.key")
-  sh("systemctl restart munge")
-end
-
-$log.info("mounting filesystems")
-sh("mkdir -p /home/\#{zinfo['owner']}")
-#puts " - /conda"
-#%x{diodmount -n \#{zip}:/conda /conda -o cache=fscache,cachetag=conda,ro,noatime,async,nosuid,nodev}
-$log.info("mounting /var/www")
-sh("diodmount -n \#{zip}:/var/www /var/www -o noatime,async,nosuid,nodev")
-if zinfo['owner']
-  $log.info "mounting /home/\#{zinfo['owner']}"
-  sh("diodmount -n \#{zip}:/home/\#{zinfo['owner']} /home/\#{zinfo['owner']} -o noatime,async,nosuid,nodev")
-end
-
-$log.info('writing zoneid file')
-f = File.new('/etc/zoneid', 'w')
-f.puts zid
-f.close
-
-$lock.flock(File::LOCK_UN)
-
-exit 0
-EOF
-chmod a+x /usr/local/sbin/pam-session-setup
-
-cat >>/etc/security/namespace.conf <<EOF
-/tmp  /tmp/inst/    user:mntopts=nosuid,nodev  root,#{xusers.join(',')}
-/var/tmp  /var/tmp/inst/  user:mntopts=nosuid,nodev  root,#{xusers.join(',')}
-/dev/shm  /dev/shm/inst/  tmpfs:mntopts=nosuid,nodev,size=2g  root,#{xusers.join(',')}
-/opt/dlami/nvme /opt/dlami/nvme/inst/ user  root,#{xusers.join(',')}
-EOF
-cat >>/etc/pam.d/common-session <<EOF
-session required        pam_namespace.so
-session required        pam_exec.so       /usr/local/sbin/pam-session-setup
-EOF
-cat >>/etc/pam.d/common-session-noninteractive <<EOF
-session required        pam_namespace.so
-session required        pam_exec.so       /usr/local/sbin/pam-session-setup
-EOF
-
-mkdir /opt/dlami/nvme/fscache
-cat >/etc/cachefilesd.conf <<EOF
-dir /opt/dlami/nvme/fscache
-tag conda
-brun 60%
-bcull 55%
-bstop 50%
-EOF
-cat >/etc/default/cachefilesd <<EOF
-DAEMON_OPTS=""
-RUN=yes
-EOF
-systemctl enable cachefilesd
-systemctl restart cachefilesd
-
-ln -s /opt/dlami/nvme /scratch
-mkdir -p /var/www/notebooks
-mkdir -p /conda
-
-chmod -x /etc/update-motd.d/*
-rm -f /etc/sudoers.d/90-cloud-init-users
-
-sdc-curl -XPOST http://#{$myaddr}:443/worker/ready
-
-exit 0
-EOS
+  params = TplParams.new(token)
+  tpl = ERB.new(File.read("#{__dir__}/provision-script.erb"), trim_mode: '-')
+  script = tpl.result(params.get_binding)
   escript = Base64.encode64(script)
 
   insts = $ec2rsrc.create_instances(
@@ -380,7 +157,10 @@ EOS
         resource_type: 'instance',
         tags: [{ key: 'Control', value: 'true' }]
       }
-    ]
+    ],
+    private_dns_name_options: {
+      hostname_type: 'resource-name'
+    }
   )
   inst = insts.first
 
@@ -422,6 +202,8 @@ def rebalance
     end
   end
 
+  # check for workers that are in EC2 but not in our DB
+  # terminate these
   aws_workers.each do |wname, info|
     next if db_workers[wname] and db_workers[wname][:state] != 'destroying'
     next if info[:state] == 'shutting-down'
@@ -429,6 +211,8 @@ def rebalance
     info[:inst].terminate
   end
 
+  # check for workers that are in our DB but don't exist in EC2
+  # unallocate these and get rid of them
   db_workers.each do |wname, info|
     next if aws_workers[wname] and not %w{shutting-down terminated}.include?(aws_workers[wname][:state])
     next if info[:state] == 'provisioning' and (Time.now - info[:state_change]) < 30
@@ -445,10 +229,10 @@ def rebalance
     db_workers.delete(wname)
   end
 
+  # alert about workers that have spent too long in 'provisioning' state
   db_workers.each do |wname, info|
     next unless info[:state] == 'provisioning' and (Time.now - info[:state_change]) > 1800
-    $log.warn("provision of #{wname} seems to be taking too long, will ignore it")
-    db_workers.delete(wname)
+    $log.warn("provision of #{wname} seems to be taking too long!")
   end
 
   states = Hash.new(0)
@@ -462,26 +246,27 @@ def rebalance
 
   charge_increment_mins = get_config(:charge_increment_mins).to_i
 
+  # go through all the open allocations and check if they can be charged to
+  # quota or unallocated (due to being idle)
   allocations = Hash.new([])
-  $db.exec('select * from allocations order by created asc') do |res|
+  $db.exec('select * from allocations
+      where state != \'closed\' order by created asc') do |res|
     res.each do |row|
       row.symbolize!
+
+      # collect all the 'waiting' allocations for us to use in the next step
       waiting << row if row[:state] == 'waiting'
       if row[:state] != 'waiting'
-        $alloc_sockmap[row[:id]].each do |sock|
-          sock.puts JSON.dump({
-            :status => :ok,
-            :allocation => row[:id],
-            :state => row[:state]
-          })
-        end
-        $alloc_sockmap.delete(row[:id])
+        # notify anyone waiting on this alloc, just in case there's a race
+        notify_alloc(row[:id], row[:state], do_any: false)
       end
 
       next unless %w{allocated busy}.include?(row[:state])
+
       allocated = row[:allocated].to_datetime
       next if DateTime.now - allocated < Rational(3, 24*60)
 
+      # first, update quota charging for this allocation
       charged = row[:allocated].to_datetime
       charged = row[:charged_until].to_datetime if row[:charged_until]
       now = DateTime.now
@@ -505,39 +290,50 @@ def rebalance
         end
       end
 
+      # now work out if we can unallocate it or not
+      action = nil
+
+      # work out the last time a connection was active on this allocation
+      last_connect = row[:last_connect] ? row[:last_connect].to_datetime : nil
       r = $dbssh.exec_params('select * from sessions
         where host_id = $1 and user_id = $2',
         [row[:ssh_host_id], row[:ssh_user_id]])
-      action = :unallocate
       r.each do |sess|
         sess.symbolize!
         if sess[:stopped_at].nil? and sess[:status] != 'closed'
-          action = nil
+          last_connect = DateTime.now
+          break
         end
         created = sess[:created_at].to_datetime
-        if DateTime.now - created < Rational(3, 24*60)
-          action = :unbusy unless action.nil?
-        end
+        last_connect = created if last_connect.nil? or created > last_connect
         next unless sess[:stopped_at]
         stopped = sess[:stopped_at].to_datetime
-        if DateTime.now - stopped < Rational(3, 24*60)
-          action = :unbusy unless action.nil?
-        end
+        last_connect = stopped if last_connect.nil? or stopped > last_connect
       end
 
-      next unless action
-      if action == :unbusy
-        $db.exec('begin')
-        $db.exec_params('update workers
-          set state = $2, state_change = now()
-          where hostname = $1',
-          [row[:worker_hostname], 'assigned'])
-        $db.exec_params('update allocations set state = $2
-          where id = $1', [row[:id], 'allocated'])
-        $db.exec('commit')
-      elsif action == :unallocate
+      if not last_connect.nil?
+        $db.exec_params('update allocations
+          set last_connect = $2
+          where id = $1', [row[:id], last_connect])
+      end
+
+      # if the session was never connected to and it's been 15 min, kill it
+      action = :unallocate if row[:state] == 'allocated' and last_connect.nil? and
+        DateTime.now - allocated > Rational(15, 24*60)
+
+      # if the session is idle and the last connection was >15 min ago, kill it
+      action = :unallocate if row[:state] == 'allocated' and last_connect and
+        DateTime.now - last_connect > Rational(15, 24*60)
+
+      # maximum job limit: 5 days
+      action = :unallocate if row[:state] == 'busy' and
+        last_connect.nil? or DateTime.now - last_connect > Rational(5, 1)
+
+      if action == :unallocate
         unallocate row[:id]
-        states[:assigned] -= 1
+        worker = db_workers[row[:worker_hostname]]
+        states[worker[:state].to_sym] -= 1
+        worker[:state] = :ready
         states[:ready] += 1
       end
     end
@@ -548,8 +344,8 @@ def rebalance
     alloc = waiting.shift
     wname, info = db_workers.find { |wname, info|
       info[:state] == 'ready' }
+    states[info[:state].to_sym] -= 1
     info[:state] = 'assigned'
-    states[:ready] -= 1
     states[:assigned] += 1
     allocate alloc[:id], wname
   end
@@ -561,19 +357,41 @@ def rebalance
   # next work out if we need more spares, and if so, how many
   spares = states[:provisioning] + states[:ready]
   total = states[:all]
-  $log.debug("spares = %d, total = %d (want spares = %d, max = %d)" % [
-    spares, total, pool_spares, pool_max])
 
   want = waiting.size + pool_spares - spares
   limit = pool_max - total
-  $log.debug("want extras = %d, limit = %d" % [want, limit])
   want = limit if want > limit
+
+  r = $db.exec_params('select * from pool_size_history where time > $1',
+    [Time.now - 3600])
+  max_size = max_time = nil
+  r.each do |sample|
+    sample.symbolize!
+    if max_size.nil? or sample[:total] > max_size
+      max_time = sample[:time]
+      max_size = sample[:total]
+    end
+  end
+  min_size = 1
+  unless max_time.nil?
+    min_size = (max_size - ((Time.now - max_time) / 60.0) / pool_idle_mins.to_f).ceil
+  end
+
+  $db.exec_params('insert into pool_size_history (total, spares)
+    values ($1, $2)', [total, spares])
+  $db.exec_params('delete from pool_size_history where time <= $1',
+    [Time.now - 24*3600*7])
+
+  $log.debug("spares = %d, total = %d (want spares = %d, max = %d)" % [
+    spares, total, pool_spares, pool_max])
+  $log.debug("shrink limit = %d" % [min_size])
+  $log.debug("want extras = %d, limit = %d" % [want, limit])
 
   # provision new instances!
   want.times { provision }
 
   # finally, check for any extra idle spares we can terminate
-  if states[:ready] > pool_spares
+  if states[:ready] > pool_spares and states[:all] > min_size
     db_workers.each do |hostname, info|
       next unless info[:state] == 'ready'
 
@@ -601,9 +419,37 @@ def rebalance
       awsinfo = aws_workers[hostname]
       awsinfo[:inst].terminate
       states[:ready] -= 1
-      break if states[:ready] <= pool_spares
+      states[:all] -= 1
+      break if states[:ready] <= pool_spares or states[:all] <= min_size
     end
   end
+  $log.info("rebalance finished")
+end
+
+def notify_alloc(alloc_id, state, do_any: true)
+  $alloc_sockmap[alloc_id].each do |sock|
+    begin
+      sock.puts JSON.dump({
+        :status => :ok,
+        :allocation => alloc_id,
+        :state => state
+      })
+    rescue
+    end
+  end
+  $alloc_sockmap.delete(alloc_id)
+  return unless do_any
+  $alloc_sockmap[:any].each do |sock|
+    begin
+      sock.puts JSON.dump({
+        :status => :ok,
+        :allocation => alloc_id,
+        :state => state
+      })
+    rescue
+    end
+  end
+  $alloc_sockmap.delete(:any)
 end
 
 def unallocate(alloc_id)
@@ -676,6 +522,8 @@ def unallocate(alloc_id)
 
   $dbssh.exec('commit');
   $db.exec('commit');
+
+  notify_alloc(alloc_id, 'closed')
 end
 
 def allocate(alloc_id, hostname)
@@ -706,7 +554,7 @@ def allocate(alloc_id, hostname)
     (name, ssh_key_id, url, logging)
     values ($1, $2, $3, $4) returning id',
     [host_name, $default_keyid,
-     "ssh://comp4703@#{worker[:vpn_addr]}", 'everything'])
+     "ssh://comp4703@#{worker[:vpn_addr]}", 'disabled'])
   raise 'failed to insert host' unless r.cmd_tuples > 0
   host_id = r[0]['id']
 
@@ -765,14 +613,7 @@ def allocate(alloc_id, hostname)
   $db.exec('commit')
   $dbssh.exec('commit')
 
-  $alloc_sockmap[alloc_id].each do |sock|
-    sock.puts JSON.dump({
-      :status => :ok,
-      :allocation => alloc_id,
-      :state => 'allocated'
-    })
-  end
-  $alloc_sockmap.delete(alloc_id)
+  notify_alloc(alloc_id, 'allocated')
 end
 
 File.unlink($sockpath) if File.exist?($sockpath)
@@ -828,6 +669,8 @@ loop do
     elsif obj[:operation] == 'allocate'
       $alloc_sockmap[obj[:allocation]] += [sock]
       need_rebal = true
+    elsif obj[:operation] == 'wait_any'
+      $alloc_sockmap[:any] += [sock]
     else
       sock.puts(JSON.dump({:status => :error, :reason => 'Invalid operation'}))
     end

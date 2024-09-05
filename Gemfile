@@ -9,5 +9,5 @@ gem "pg", "~> 1.5"
 gem "aws-sdk-ec2", "~> 1.470"
 gem "puma", "~> 6.4"
 gem "ssh_data", "~> 1.3"
-
 gem "http_signatures", "~> 1.1"
+gem "connection_pool", "~> 2.4"

@@ -1,0 +1,166 @@
+#!/bin/bash
+set -ex
+log=/var/log/userdata-script
+touch ${log}
+chmod 0600 ${log}
+exec >>${log} 2>&1
+
+# stop background upgrades
+systemctl stop unattended-upgrades.service
+systemctl stop apt-daily-upgrade.timer
+systemctl stop apt-daily.timer
+
+# stop docker etc
+for x in docker.service containerd.service snapd.service docker.socket snapd.socket; do
+  systemctl stop ${x}
+  systemctl disable ${x}
+done
+
+echo 'AuthorizedKeysFile /etc/ssh/authorized_keys/%u' >>/etc/ssh/sshd_config
+mkdir /etc/ssh/authorized_keys
+echo '<%= @default_pubkey %>' >/etc/ssh/authorized_keys/root
+echo '<%= @default_pubkey %>' >/etc/ssh/authorized_keys/comp4703
+systemctl restart ssh
+
+# xusers
+groupadd xusers
+for user in <%= @xusers.join(' ') %>; do
+  useradd -g xusers -s /bin/bash -m ${user}
+  mkdir -p /home/${user}/.ssh
+  curl -o /etc/ssh/authorized_keys/${user} https://internal.eait.uq.edu.au/api/sshkeys.php/${user}
+done
+echo "%xusers ALL=(ALL) NOPASSWD: ALL" | tee -a /etc/sudoers
+
+# delete the default ubuntu user
+userdel -fr ubuntu
+
+# basic packages
+apt-get update
+#apt-get upgrade -y
+apt-get install -y nodejs npm munge ruby cachefilesd
+npm install -g sshpk
+
+# npm refuses to install from git+https now
+cd /usr/local/lib
+git clone https://github.com/eait-itig/node-smartdc-auth
+cd node-smartdc-auth
+npm install
+npm install -g .
+chmod -R a+rX /usr/local/lib/node-smartdc-auth
+
+# set up auth key
+mkdir -p /var/lib/auth-keys/keys
+chmod 0700 /var/lib/auth-keys/keys
+ssh-keygen -t ecdsa -b 256 -P '' -C $(hostname) -f /var/lib/auth-keys/keys/default
+mkdir -p /var/lib/auth-keys/sockets
+curl -T /var/lib/auth-keys/keys/default.pub http://<%= @myaddr %>:443/worker/provision/<%= @token %>
+
+cat >/etc/systemd/system/auth-agent.service <<EOF
+[Unit]
+Description=ssh-agent for auth to control system
+After=network.target
+
+[Service]
+User=root
+Environment=SSH_AUTH_SOCK=/var/lib/auth-keys/sockets/default
+Type=forking
+ExecStart=/usr/bin/ssh-agent -a /var/lib/auth-keys/sockets/default
+PermissionsStartOnly=true
+ExecStartPost=/usr/bin/ssh-add /var/lib/auth-keys/keys/default
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable auth-agent
+systemctl start auth-agent
+
+KEYID=$(ssh-keygen -l -f /var/lib/auth-keys/keys/default.pub | awk '{print $2}')
+
+echo 'export SSH_AUTH_SOCK=/var/lib/auth-keys/sockets/default' >/etc/profile.d/authkeys.sh
+echo "export SDC_KEY_ID=${KEYID}" >>/etc/profile.d/authkeys.sh
+echo "export SDC_ACCOUNT=$(hostname)" >>/etc/profile.d/authkeys.sh
+source /etc/profile.d/authkeys.sh
+
+# set up the login user
+groupadd -g 1000 comp4703
+useradd -u 1000 -g comp4703 -G plugdev,video -s /bin/bash comp4703
+mkdir /home/comp4703
+
+cat >/usr/local/sbin/idle-session-check <%= heredoc 'idle-session-check.erb' %>
+chmod a+x /usr/local/sbin/idle-session-check
+
+cat >/etc/systemd/system/idle-session-check.service <<EOF
+[Unit]
+Description=Check for and kill any idle COMP4703 sessions
+Wants=idle-session-check.timer
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/idle-session-check
+EOF
+
+cat >/etc/systemd/system/idle-session-check.timer <<EOF
+[Unit]
+Description=Check for and kill any idle COMP4703 sessions
+Requires=idle-session-check.service
+
+[Timer]
+Unit=idle-session-check.service
+OnCalendar=*-*-* *:2/5
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable idle-session-check.timer
+systemctl start idle-session-check.timer
+
+cat >/usr/local/sbin/pam-session-setup <%= heredoc 'pam-session-setup.erb' %>
+chmod a+x /usr/local/sbin/pam-session-setup
+
+cat >>/etc/security/namespace.conf <<EOF
+/tmp              /tmp/inst/            user  root,<%= @xusers.join(',') %>
+/var/tmp          /var/tmp/inst/        user  root,<%= @xusers.join(',') %>
+/dev/shm          /dev/shm/inst/        tmpfs:mntopts=nosuid,nodev,size=2g    root,<%= @xusers.join(',') %>
+/opt/dlami/nvme   /opt/dlami/nvme/inst/ user  root,<%= @xusers.join(',') %>
+EOF
+cat >>/etc/pam.d/common-session <<EOF
+session required        pam_namespace.so
+session required        pam_exec.so       /usr/local/sbin/pam-session-setup
+EOF
+cat >>/etc/pam.d/common-session-noninteractive <<EOF
+session required        pam_namespace.so
+session required        pam_exec.so       /usr/local/sbin/pam-session-setup
+EOF
+
+mkdir /opt/dlami/nvme/fscache
+cat >/etc/cachefilesd.conf <<EOF
+dir /opt/dlami/nvme/fscache
+tag conda
+brun 60%
+bcull 55%
+bstop 50%
+EOF
+cat >/etc/default/cachefilesd <<EOF
+DAEMON_OPTS=""
+RUN=yes
+EOF
+systemctl enable cachefilesd
+systemctl restart cachefilesd
+
+systemctl enable rpc-statd.service
+systemctl start rpc-statd.service
+
+ln -s /opt/dlami/nvme /scratch
+mkdir -p /conda
+
+chmod -x /etc/update-motd.d/*
+rm -f /etc/sudoers.d/90-cloud-init-users
+
+sdc-curl -XPOST http://<%= @myaddr %>:443/worker/ready
+
+exit 0

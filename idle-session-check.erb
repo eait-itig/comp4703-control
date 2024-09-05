@@ -1,0 +1,144 @@
+#!/usr/bin/env ruby
+require 'open3'
+require 'logger'
+require 'socket'
+require 'date'
+require 'json'
+
+LOCK_FILE = '/run/idle-session-check.lock'
+LOG_FILE = '/var/log/idle-session-check.log'
+NONIDLE_STAMP = '/run/nonidle-stamp'
+
+$lock = File.open(LOCK_FILE, File::CREAT)
+$lock.flock(File::LOCK_EX)
+
+$logfile = File.open(LOG_FILE, File::WRONLY | File::APPEND | File::CREAT | File::SYNC)
+$stderr = $logfile
+$log = Logger.new($logfile)
+$log.level = Logger::DEBUG
+
+def sh(cmd, input: nil, check: true)
+  $log.info("CMD: #{cmd}")
+  $logfile.flush
+  outlines = []
+  Open3.popen3(cmd) do |stdin, stdout, stderr, waiter|
+    stdin.write(input) if not input.nil?
+    stdin.close
+    fds = [stdout, stderr]
+    loop do
+      rs, _, _ = IO.select(fds)
+      rs.each do |fd|
+        if fd.eof?
+          fds.delete(fd)
+          next
+        end
+        line = fd.readline.chomp
+        if fd == stdout and line != ''
+          outlines << line
+          $log.info('> ' + line)
+        elsif fd == stderr
+          $log.error('> ' + line)
+        end
+      end
+      break if fds.empty?
+    end
+    exit_status = waiter.value
+    if exit_status != 0 and check
+      raise Exception.new("Command '#{cmd}' exited with status #{exit_status}")
+    end
+  end
+  outlines
+end
+
+ENV['PATH'] = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+ENV['SSH_AUTH_SOCK'] = '/var/lib/auth-keys/sockets/default'
+ENV['SDC_KEY_ID'] = sh('ssh-add -l').first.split[1]
+ENV['SDC_ACCOUNT'] = Socket.gethostname
+
+$log.info 'starting idle session check'
+
+out = sh('sdc-curl -s http://<%= @myaddr %>:443/worker/assignment').join("\n")
+if out =~ /no valid assignment/
+  $log.info 'no valid assigment for this node, killing all procs'
+  sh('pkill -u comp4703', check: false)
+  sh('pkill -U comp4703', check: false)
+  exit 0
+end
+obj = JSON.parse(out, :symbolize_names => true)
+
+pgreps = nil
+begin
+  pgreps = sh('pgrep -af -u comp4703')
+rescue Exception
+  if cdelta < Rational(5,24*60)
+    $log.info 'no processes running, but last connect was <5min ago'
+    exit 0
+  end
+  $log.info 'no processes running, marking as idle'
+  sh('sdc-curl -XPOST http://<%= @myaddr %>:443/worker/idle')
+  exit 0
+end
+
+sh('nvidia-smi').each do |line|
+  next unless line =~ /[ ]+([0-9]+)W[ ]*[^ ][ ]*([0-9]+)W[ ]*/
+  pwr_frac = $1.to_f / $2.to_f
+  if pwr_frac > 0.2
+    $log.info "not idle: GPU is using #{(pwr_frac * 100).round}% power"
+    sh("touch #{NONIDLE_STAMP}")
+    exit 0
+  else
+    $log.info "GPU is using #{(pwr_frac * 100).round}% power"
+  end
+end
+
+got_headings = 0
+sh('top -bn2 -U comp4703').each do |line|
+  fields = line.split.map { |f| f.strip }
+  if got_headings < 2
+    next unless fields[0] == 'PID' and fields[8] == '%CPU'
+    got_headings += 1
+    next
+  end
+  if fields[8].to_f > 5.0
+    $log.info "not idle: pid #{fields[0]} (#{fields.last}) is using >10% cpu"
+    sh("touch #{NONIDLE_STAMP}")
+    exit 0
+  end
+end
+
+last_nonidle = File.exist?(NONIDLE_STAMP) ? File.mtime(NONIDLE_STAMP).to_datetime : nil
+last_connect = DateTime.parse(obj[:last_connect])
+cdelta = DateTime.now - last_connect
+idelta = last_nonidle ? (DateTime.now - last_nonidle) : Rational(7,1)
+
+pgreps = sh('pgrep -af -u comp4703')
+pgreps.each do |line|
+  next unless line =~ /^([0-9]+)[ ]+.*$/
+  pid = $1.to_i
+  cmdline = $2
+  next if cmdline =~ /^-bash/
+  next if cmdline =~ /^sshd:/
+  next if cmdline =~ /^tmux/
+  next if cmdline =~ /jupyter/ or cmdline =~ /jupyter-lab/
+  if (cmdline =~ /ipykernel/ or cmdline =~ /python/) and idelta < Rational(2, 24)
+    $log.info "not idle: ipykernel running in pid #{pid}, cpu/gpu usage in last 2h"
+    exit 0
+  end
+  if cdelta < Rational(15, 24*60) or idelta < Rational(15, 24*60)
+    $log.info "not idle: something is still running, and last action was <15min ago"
+    exit 0
+  end
+end
+
+$log.info "looks idle, killing all comp4703 processes with SIGTERM"
+sh('pkill -u comp4703', check: false)
+sh('pkill -U comp4703', check: false)
+
+$log.info "now SIGKILL in 10 sec"
+sleep(10)
+$log.info "sending SIGKILL"
+sh('pkill -KILL -u comp4703', check: false)
+sh('pkill -KILL -U comp4703', check: false)
+
+$log.info "marking idle in controller"
+sh('sdc-curl -XPOST http://<%= @myaddr %>:443/worker/idle')

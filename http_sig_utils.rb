@@ -42,6 +42,20 @@ class RackMessageWrapper
   end
 end
 
+class SSOVerification
+  def initialize(request:)
+    @req = request
+  end
+
+  def valid?
+    true
+  end
+
+  def key_info
+    {:type => :sso, :user => @req.get_header('HTTP_X_UQ_USER')}
+  end
+end
+
 class AuthzVerification < HttpSignatures::Verification
   def initialize(message:, key_store:, required_headers:[])
     super(message: message, key_store: key_store)
@@ -68,10 +82,14 @@ class AuthzVerification < HttpSignatures::Verification
   end
 
   def valid?
-    return false if not super
-    signedhdrs = header_list.to_a
-    @reqhdrs.each { |h| return false unless signedhdrs.include?(h) }
-    return true
+    begin
+      return false if not super
+      signedhdrs = header_list.to_a
+      @reqhdrs.each { |h| return false unless signedhdrs.include?(h) }
+      return true
+    rescue KeyError
+      return false
+    end
   end
 
   def signature_header

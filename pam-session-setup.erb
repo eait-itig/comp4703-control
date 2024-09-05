@@ -1,0 +1,133 @@
+#!/usr/bin/env ruby
+User = ENV['PAM_USER']
+Action = ENV['PAM_TYPE']
+# exclude root and xusers as early as possible in this script
+# so that there's minimal chance of the code further down blocking root logins
+exit 0 if %w{root <%= @xusers.join(' ') %>}.include?(User)
+exit 0 unless %w{open_session}.include?(Action)
+
+require 'json'
+require 'base64'
+require 'logger'
+require 'open3'
+require 'socket'
+
+LOCK_FILE = '/run/pam-session-setup.lock'
+LOG_FILE = '/var/log/pam-session-setup.log'
+
+$lock = File.open(LOCK_FILE, File::CREAT)
+$lock.flock(File::LOCK_EX)
+
+$logfile = File.open(LOG_FILE, File::WRONLY | File::APPEND | File::CREAT | File::SYNC)
+$stderr = $logfile
+$log = Logger.new($logfile)
+$log.level = Logger::DEBUG
+
+def sh(cmd, input: nil, check: true)
+  $log.info("CMD: #{cmd}")
+  $logfile.flush
+  outlines = []
+  Open3.popen3(cmd) do |stdin, stdout, stderr, waiter|
+    stdin.write(input) if not input.nil?
+    stdin.close
+    fds = [stdout, stderr]
+    loop do
+      rs, _, _ = IO.select(fds)
+      rs.each do |fd|
+        if fd.eof?
+          fds.delete(fd)
+          next
+        end
+        line = fd.readline.chomp
+        if fd == stdout and line != ''
+          outlines << line
+          $log.info('> ' + line)
+        elsif fd == stderr
+          $log.error('> ' + line)
+        end
+      end
+      break if fds.empty?
+    end
+    exit_status = waiter.value
+    if exit_status != 0 and check
+      raise Exception.new("Command '#{cmd}' exited with status #{exit_status}")
+    end
+  end
+  outlines
+end
+
+ENV['PATH'] = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+ENV['SSH_AUTH_SOCK'] = '/var/lib/auth-keys/sockets/default'
+ENV['SDC_KEY_ID'] = sh('ssh-add -l').first.split[1]
+ENV['SDC_ACCOUNT'] = Socket.gethostname
+
+$log.info('getting assignment payload')
+output = sh('sdc-curl -s http://<%= @myaddr %>:443/worker/assignment').join("\n")
+zinfo = nil
+begin
+  zinfo = JSON.parse(output, symbolize_names: true)
+rescue Exception => ex
+  $log.error("failed to parse assignment payload: #{ex.inspect}")
+  exit 1
+end
+zid = zinfo[:zone_id]
+zip = zinfo[:zone_ip]
+nfsip = zinfo[:nfs_server_ip]
+owner = zinfo[:owner]
+
+$log.info "setting up worker for #{owner} (#{zid})"
+
+$log.info "make jupyter sockets dir"
+sh("mkdir -p /run/jupyter")
+sh("rm -f /run/jupyter/*")
+sh("chown #{User} /run/jupyter")
+
+if not File.exist?('/etc/zoneid') or File.new('/etc/zoneid').read.strip != zid
+  $log.info 'looks like a change of owner, killing processes'
+  sh("pkill -u #{User}", check: false)
+  sh("pkill -U #{User}", check: false)
+
+  $log.info 'cleaning up scratch space'
+  sh("rm -fr /tmp/inst/#{User} /var/tmp/inst/#{User} /opt/nvme/inst/#{User}")
+
+  $log.info 'updating munge key'
+  f = File.new('/etc/munge/munge.key', 'w')
+  f.write Base64.decode64(zinfo[:munge_key])
+  f.close
+  sh("chown munge:munge /etc/munge/munge.key")
+  sh("chmod 0600 /etc/munge/munge.key")
+  sh("systemctl restart munge")
+
+  $log.info('writing zoneid file')
+  f = File.new('/etc/zoneid', 'w')
+  f.puts zid
+  f.close
+end
+
+exit 0 if not owner
+
+$log.info("mounting filesystems")
+attempts = 0
+begin
+  $log.info "mounting /conda"
+  sh("mount -t nfs -o vers=3,nconnect=8,fsc,nosuid,nodev,noatime #{nfsip}:/storage/conda/#{owner} /conda")
+  $log.info "mounting /home/#{owner}"
+  sh("mkdir -p /home/#{owner}")
+  sh("mount -t nfs -o vers=3,nconnect=8,nosuid,nodev,noatime #{nfsip}:/storage/home/#{owner} /home/#{User}")
+  $log.info "mounting /home/#{owner}/.cache"
+  sh("mkdir -p /home/#{owner}/.cache")
+  sh("mount -t nfs -o vers=3,nconnect=8,fsc,nosuid,nodev,noatime #{nfsip}:/storage/cache/#{owner} /home/#{User}/.cache")
+rescue Exception
+  attempts += 1
+  if attempts < 30
+    $log.info "sleeping for 2 sec"
+    sleep 2
+    retry
+  end
+  $log.info "giving up on mounting :("
+  exit 1
+end
+
+$lock.flock(File::LOCK_UN)
+
+exit 0
