@@ -28,7 +28,8 @@ CREATE TABLE public.allocations (
     ssh_host_group_id bigint,
     ssh_user_group_id bigint,
     ssh_acl_id bigint,
-    charged_until timestamp without time zone
+    charged_until timestamp without time zone,
+    last_connect timestamp without time zone
 );
 CREATE INDEX ON public.allocations USING btree (ssh_user_id, ssh_host_id);
 CREATE INDEX ON public.allocations USING btree (worker_hostname, state);
@@ -67,9 +68,23 @@ CREATE TABLE public.zones (
     auth_key character varying(1024) NOT NULL
 );
 
+CREATE TABLE public.pool_size_history (
+    "time" timestamp without time zone DEFAULT now() NOT NULL PRIMARY KEY,
+    total integer NOT NULL,
+    spares integer NOT NULL
+);
+
+CREATE TABLE public.nfs_servers (
+    ip inet NOT NULL PRIMARY KEY,
+    hostname character varying(32) NOT NULL,
+    auth_key character varying(1024)
+);
+
 GRANT USAGE ON SEQUENCE public.allocation_id_seq TO "www-data";
 GRANT SELECT,INSERT,UPDATE ON TABLE public.allocations TO "www-data";
 GRANT SELECT,INSERT,UPDATE ON TABLE public.quotas TO "www-data";
 GRANT SELECT,UPDATE ON TABLE public.workers TO "www-data";
 GRANT SELECT ON TABLE public.zones TO "www-data";
 GRANT SELECT,UPDATE ON TABLE public.config TO "www-data";
+GRANT SELECT ON TABLE public.nfs_servers TO "www-data";
+GRANT SELECT ON TABLE public.pool_size_history TO "www-data";
