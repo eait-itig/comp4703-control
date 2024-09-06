@@ -117,6 +117,9 @@ begin
   $log.info "mounting /home/#{owner}/.cache"
   sh("mkdir -p /home/#{owner}/.cache")
   sh("mount -t nfs -o vers=3,nconnect=8,fsc,nosuid,nodev,noatime #{nfsip}:/storage/cache/#{owner} /home/#{User}/.cache")
+  $log.info "mounting /zone/home/#{owner} from zone"
+  sh("mkdir -p /zone/home/#{owner}")
+  sh("diodmount -n #{zip}:/home/#{owner} /zone/home/#{owner} -o noatime,nosuid,nodev,cache=fscache")
 rescue Exception
   attempts += 1
   if attempts < 30

@@ -130,6 +130,20 @@ module Control
 
     get '/' do
       halt 403, "access denied\r\n" unless @auth.valid?
+      user = @auth.key_info[:user]
+      $db_pool.with do |db|
+        r = db.exec_params('select * from zones where owner = $1', [user])
+        halt 404, "no zone allocated for #{user}\r\n" if r.ntuples == 0
+        @zone = r[0].symbolize
+        @zone[:alias] = "comp4703-#{@zone[:id].split('-').first}"
+        @zone[:url] = "https://#{@zone[:alias]}.uqcloud.net"
+        r = db.exec_params('select * from quotas where username = $1', [user])
+        @quota = r[0].symbolize
+        r = db.exec_params('select * from allocations where zone_id = $1
+          and state != \'closed\'', [@zone[:id]])
+        @allocations = []
+        r.each { |a| @allocations << a.symbolize }
+      end
       erb :index
     end
 
@@ -222,11 +236,25 @@ module Control
         r = db.exec_params('update allocations
           set state = \'allocated\'
           where worker_hostname = $1
-          and state = \'busy\'')
+          and state = \'busy\'', [hostname])
         halt 200, "ok: no allocations changed\r\n" if r.cmd_tuples < 1
       end
       rebalance
       "ok: worker #{hostname} marked idle\r\n"
+    end
+
+    post '/worker/busy' do
+      halt 403, "access denied\r\n" unless @auth.valid? and @auth.key_info[:type] == :worker
+      hostname = @auth.key_info[:hostname]
+      $db_pool.with do |db|
+        r = db.exec_params('update allocations
+          set state = \'busy\'
+          where worker_hostname = $1
+          and state = \'allocated\'', [hostname])
+        halt 200, "ok: no allocations changed\r\n" if r.cmd_tuples < 1
+      end
+      rebalance
+      "ok: worker #{hostname} marked busy\r\n"
     end
 
     put '/worker/provision/:token' do |token|

@@ -161,6 +161,6 @@ mkdir -p /conda
 chmod -x /etc/update-motd.d/*
 rm -f /etc/sudoers.d/90-cloud-init-users
 
-sdc-curl -XPOST http://<%= @myaddr %>:443/worker/ready
+sdc-curl -s -XPOST http://<%= @myaddr %>:443/worker/ready
 
 exit 0

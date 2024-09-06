@@ -294,40 +294,46 @@ def rebalance
       action = nil
 
       # work out the last time a connection was active on this allocation
-      last_connect = row[:last_connect] ? row[:last_connect].to_datetime : nil
+      last_active = row[:last_connect] ? row[:last_connect].to_datetime : nil
+      last_connect = nil
       r = $dbssh.exec_params('select * from sessions
         where host_id = $1 and user_id = $2',
         [row[:ssh_host_id], row[:ssh_user_id]])
       r.each do |sess|
         sess.symbolize!
         if sess[:stopped_at].nil? and sess[:status] != 'closed'
-          last_connect = DateTime.now
+          last_active = DateTime.now
           break
         end
         created = sess[:created_at].to_datetime
+        last_active = created if last_active.nil? or created > last_active
         last_connect = created if last_connect.nil? or created > last_connect
         next unless sess[:stopped_at]
         stopped = sess[:stopped_at].to_datetime
-        last_connect = stopped if last_connect.nil? or stopped > last_connect
+        last_active = stopped if last_active.nil? or stopped > last_active
       end
 
-      if not last_connect.nil?
+      if not last_active.nil?
         $db.exec_params('update allocations
           set last_connect = $2
-          where id = $1', [row[:id], last_connect])
+          where id = $1', [row[:id], last_active])
       end
 
       # if the session was never connected to and it's been 15 min, kill it
-      action = :unallocate if row[:state] == 'allocated' and last_connect.nil? and
+      action = :unallocate if row[:state] == 'allocated' and last_active.nil? and
         DateTime.now - allocated > Rational(15, 24*60)
 
-      # if the session is idle and the last connection was >15 min ago, kill it
+      # if the session is idle and the last active connection was >10 min ago, kill it
+      action = :unallocate if row[:state] == 'allocated' and last_active and
+        DateTime.now - last_active > Rational(10, 24*60)
+
+      # if the session is idle and the last connection start was >15 min ago, kill it
       action = :unallocate if row[:state] == 'allocated' and last_connect and
         DateTime.now - last_connect > Rational(15, 24*60)
 
       # maximum job limit: 5 days
       action = :unallocate if row[:state] == 'busy' and
-        last_connect.nil? or DateTime.now - last_connect > Rational(5, 1)
+        DateTime.now - allocated > Rational(5, 1)
 
       if action == :unallocate
         unallocate row[:id]

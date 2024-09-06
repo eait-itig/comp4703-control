@@ -7,8 +7,41 @@
     <link rel="stylesheet" href="/static/bootstrap.min.css" />
   </head>
   <body>
-    <h1>Hello, world!</h1>
-    <p>You are <code><%= @auth.key_info.inspect %></code></p>
+    <div class="container">
+      <h1>COMP4703 GPU control for <%= @auth.key_info[:user] %></h1>
+
+      <h3>Quota</h3>
+      <div class="progress">
+        <% classes = %w{progress-bar progress-bar-striped} %>
+        <% classes << 'bg-warning' if @quota[:used_mins] > 0.75 * @quota[:quota_mins] %>
+        <% classes << 'bg-danger' if @quota[:used_mins] > 0.9 * @quota[:quota_mins] %>
+        <% percent = 100 * @quota[:used_mins] / @quota[:quota_mins] %>
+        <div class="<%= classes.join(' ') %>" role="progressbar" aria-valuenow="<%= @quota[:used_mins] %>" aria-valuemin="0" aria-valuemax="<%= @quota[:quota_mins] %>" style="width: <%= percent %>%;">
+        </div>
+      </div>
+      <table class="table">
+        <tr>
+          <th scope="row">Time quota</th>
+          <td><%= @quota[:quota_mins] %> minutes</td>
+        </tr>
+        <tr>
+          <th scope="row">Used</th>
+          <td><%= @quota[:used_mins] %> minutes</td>
+        </tr>
+        <tr>
+          <th scope="row">Remaining</th>
+          <td><%= @quota[:quota_mins] - @quota[:used_mins] %> minutes</td>
+        </tr>
+      </table>
+
+      <h3>My zone</h3>
+      <p>Your zone is <a href="<%= @zone[:url] %>"><%= @zone[:alias] %></a>.</p>
+
+      <h3>My sessions</h3>
+      <p>Current sessions:</p>
+      <table class="table">
+      </table>
+    </div>
     <script src="/static/bootstrap.bundle.min.js"></script>
   </body>
 </html>

@@ -64,7 +64,18 @@ if out =~ /no valid assignment/
   sh('pkill -U comp4703', check: false)
   exit 0
 end
-obj = JSON.parse(out, :symbolize_names => true)
+obj = nil
+begin
+  obj = JSON.parse(out, symbolize_names: true)
+rescue Exception => ex
+  $log.error "failed to parse assignment blob: #{ex.inspect}"
+  exit 1
+end
+
+last_nonidle = File.exist?(NONIDLE_STAMP) ? File.mtime(NONIDLE_STAMP).to_datetime : nil
+last_connect = obj[:last_connect] ? DateTime.parse(obj[:last_connect]) : nil
+cdelta = last_connect ? DateTime.now - last_connect : Rational(7,1)
+idelta = last_nonidle ? (DateTime.now - last_nonidle) : Rational(7,1)
 
 pgreps = nil
 begin
@@ -75,7 +86,7 @@ rescue Exception
     exit 0
   end
   $log.info 'no processes running, marking as idle'
-  sh('sdc-curl -XPOST http://<%= @myaddr %>:443/worker/idle')
+  sh('sdc-curl -s -XPOST http://<%= @myaddr %>:443/worker/idle')
   exit 0
 end
 
@@ -84,6 +95,7 @@ sh('nvidia-smi').each do |line|
   pwr_frac = $1.to_f / $2.to_f
   if pwr_frac > 0.2
     $log.info "not idle: GPU is using #{(pwr_frac * 100).round}% power"
+    sh('sdc-curl -s -XPOST http://<%= @myaddr %>:443/worker/busy')
     sh("touch #{NONIDLE_STAMP}")
     exit 0
   else
@@ -101,44 +113,33 @@ sh('top -bn2 -U comp4703').each do |line|
   end
   if fields[8].to_f > 5.0
     $log.info "not idle: pid #{fields[0]} (#{fields.last}) is using >10% cpu"
+    sh('sdc-curl -s -XPOST http://<%= @myaddr %>:443/worker/busy')
     sh("touch #{NONIDLE_STAMP}")
     exit 0
   end
 end
 
-last_nonidle = File.exist?(NONIDLE_STAMP) ? File.mtime(NONIDLE_STAMP).to_datetime : nil
-last_connect = DateTime.parse(obj[:last_connect])
-cdelta = DateTime.now - last_connect
-idelta = last_nonidle ? (DateTime.now - last_nonidle) : Rational(7,1)
-
 pgreps = sh('pgrep -af -u comp4703')
 pgreps.each do |line|
-  next unless line =~ /^([0-9]+)[ ]+.*$/
+  next unless line =~ /^([0-9]+)[ ]+(.*)$/
   pid = $1.to_i
   cmdline = $2
   next if cmdline =~ /^-bash/
   next if cmdline =~ /^sshd:/
   next if cmdline =~ /^tmux/
   next if cmdline =~ /jupyter/ or cmdline =~ /jupyter-lab/
-  if (cmdline =~ /ipykernel/ or cmdline =~ /python/) and idelta < Rational(2, 24)
-    $log.info "not idle: ipykernel running in pid #{pid}, cpu/gpu usage in last 2h"
+  if (cmdline =~ /ipykernel/ or cmdline =~ /python/) and idelta < Rational(1, 24)
+    $log.info "not idle: ipykernel running in pid #{pid}, cpu/gpu usage in last 1h"
+    sh('sdc-curl -s -XPOST http://<%= @myaddr %>:443/worker/busy')
     exit 0
   end
-  if cdelta < Rational(15, 24*60) or idelta < Rational(15, 24*60)
-    $log.info "not idle: something is still running, and last action was <15min ago"
+  next if cmdline =~ /ipykernel/ or cmdline =~ /python/
+  if idelta < Rational(2, 24)
+    $log.info "not idle: cpu/gpu usage in last 2h and '#{cmdline}' is running"
+    sh('sdc-curl -s -XPOST http://<%= @myaddr %>:443/worker/busy')
     exit 0
   end
 end
 
-$log.info "looks idle, killing all comp4703 processes with SIGTERM"
-sh('pkill -u comp4703', check: false)
-sh('pkill -U comp4703', check: false)
-
-$log.info "now SIGKILL in 10 sec"
-sleep(10)
-$log.info "sending SIGKILL"
-sh('pkill -KILL -u comp4703', check: false)
-sh('pkill -KILL -U comp4703', check: false)
-
 $log.info "marking idle in controller"
-sh('sdc-curl -XPOST http://<%= @myaddr %>:443/worker/idle')
+sh('sdc-curl -s -XPOST http://<%= @myaddr %>:443/worker/idle')
