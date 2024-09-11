@@ -1,0 +1,4 @@
+#!/bin/bash
+set -ex
+incr=$(echo "select value from config where key = 'quota_mins_added_per_hour';" | /usr/bin/psql -t -A -F, control)
+echo "update quotas set quota_mins = quota_mins + ${incr};" | /usr/bin/psql control
