@@ -14,12 +14,14 @@ require 'socket'
 
 LOCK_FILE = '/run/pam-session-setup.lock'
 LOG_FILE = '/var/log/pam-session-setup.log'
+NONIDLE_STAMP = '/run/nonidle-stamp'
 
 $lock = File.open(LOCK_FILE, File::CREAT)
 $lock.flock(File::LOCK_EX)
 
 $logfile = File.open(LOG_FILE, File::WRONLY | File::APPEND | File::CREAT | File::SYNC)
 $stderr = $logfile
+$logfile.chmod(0600)
 $log = Logger.new($logfile)
 $log.level = Logger::DEBUG
 
@@ -89,6 +91,9 @@ if not File.exist?('/etc/zoneid') or File.new('/etc/zoneid').read.strip != zid
 
   $log.info 'cleaning up scratch space'
   sh("rm -fr /tmp/inst/#{User} /var/tmp/inst/#{User} /opt/nvme/inst/#{User}")
+
+  $log.info 'deleting nonidle stamp'
+  sh("rm -fr #{NONIDLE_STAMP}")
 
   $log.info 'updating munge key'
   f = File.new('/etc/munge/munge.key', 'w')

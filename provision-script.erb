@@ -37,7 +37,7 @@ userdel -fr ubuntu
 # basic packages
 apt-get update
 #apt-get upgrade -y
-apt-get install -y nodejs npm munge ruby cachefilesd
+apt-get install -y nodejs npm diod munge ruby cachefilesd
 npm install -g sshpk
 
 # npm refuses to install from git+https now
@@ -108,7 +108,7 @@ Requires=idle-session-check.service
 
 [Timer]
 Unit=idle-session-check.service
-OnCalendar=*-*-* *:2/5
+OnCalendar=*-*-* *:2/3
 AccuracySec=30s
 
 [Install]

@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="refresh" content="300" />
+    <title>COMP4703 admin</title>
+    <link rel="stylesheet" href="/static/bootstrap.min.css" />
+  </head>
+  <body class="bg-light">
+    <div class="container-lg">
+      <h1>COMP4703 admin</h1>
+
+      <hr/>
+      <h2>Config</h2>
+      <table class="table table-striped table-sm mb-5" style="max-width: 500px;">
+        <thead>
+          <tr>
+            <th>Key</th>
+            <th>Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          <% @config.each do |c| %>
+          <tr>
+            <td><%= c[:key] %></td>
+            <td><code><%= c[:value] %></code></td>
+          </tr>
+          <% end %>
+        </tbody>
+      </table>
+
+      <hr/>
+      <h2>GPU workers</h2>
+      <table class="table table-striped mb-3">
+        <thead>
+          <tr>
+            <th style="width: 12em">Hostname</th>
+            <th style="width: 10em" class="d-none d-lg-table-cell">IP address</th>
+            <th style="width: 8em">State</th>
+            <th>Allocated to</th>
+            <th>Changed</th>
+          </tr>
+        </thead>
+        <tbody>
+          <% @workers.each do |w| %>
+          <% classes = [] %>
+          <% classes << 'table-success' if w[:state] == 'ready' %>
+          <% classes << 'table-warning' if w[:state] == 'provisioning' %>
+          <% classes << 'table-danger' if w[:state] == 'provisioning' and (Time.now - w[:state_change]) > 3600 %>
+          <tr class="<%= classes.join(' ') %>">
+            <td><code style="font-weight: bold; color: black;"><%= w[:hostname] %></code></td>
+            <td class="d-none d-lg-table-cell"><code><%= w[:vpn_addr] %></code></td>
+            <td>
+              <% classes = %w{badge} %>
+              <% classes << 'bg-warning' if w[:state] == 'provisioning' %>
+              <% classes << 'bg-success' if w[:state] == 'ready' %>
+              <% classes << 'bg-primary' if w[:state] == 'assigned' %>
+              <% classes << 'bg-secondary' if w[:state] == 'busy' %>
+              <% classes << 'bg-error' if w[:state] == 'destroying' %>
+              <span class="<%= classes.join(' ') %>"><%= w[:state] %></span>
+            </td>
+            <td>
+              <% a = @allocations.find { |a| a[:worker_hostname] == w[:hostname] and a[:state] != 'closed' } %>
+              <% if a %>
+              <% z = @zones[a[:zone_id]] %>
+              <code style="font-weight: bold; color: black;"><%= z[:owner] %></code>
+              <br/> on <code><%= a[:zone_id].split('-').first %></code>
+              <% else %>
+              <span style="font-style: italic; opacity: 0.6;">(none)</span>
+              <% end %>
+            </td>
+            <td>
+              <code class="text-dark"><%= w[:state_change].strftime('%Y-%m-%d %H:%M:%SZ') %></code>
+              <span style="font-style: italic; opacity: 0.6;">(<%= Duration.new(seconds: Time.now - w[:state_change]) %> ago)</span>
+            </td>
+          </tr>
+          <% end %>
+          <% if @workers.empty? %>
+          <tr>
+            <td colspan="5" style="font-style: italic; opacity: 0.6;">(no GPU workers running)</td>
+          <% end %>
+        </tbody>
+      </table>
+
+      <div id="worker-graph" class="mb-5 mx-auto">
+      </div>
+
+      <hr/>
+      <h2>Active allocations in last 3h</h2>
+      <table class="table table-striped mb-5">
+        <thead>
+          <tr>
+            <th style="width: 4em" class="d-none d-lg-table-cell" style="width: 5em;">ID</th>
+            <th style="width: 9em">Zone/User</th>
+            <th style="width: 6em">State</th>
+            <th style="width: 11em">GPU</th>
+            <th>Created</th>
+            <th>Queued for</th>
+            <th>Running for</th>
+            <th>Last active</th>
+          </tr>
+        </thead>
+        <tbody>
+          <% @allocations.each do |a| %>
+          <% style = [] %>
+          <% style << 'opacity: 0.5' if a[:state] == 'closed' %>
+          <tr style="<%= style.join('; ') %>">
+            <td class="d-none d-lg-table-cell"><%= a[:id] %></td>
+            <td>
+              <% z = @zones[a[:zone_id]] %>
+              <code style="font-weight: bold; color: black;"><%= z[:owner] %></code>
+              <br/> on <code><%= a[:zone_id].split('-').first %></code>
+            </td>
+            <td>
+              <% classes = %w{badge} %>
+              <% classes << 'bg-warning' if a[:state] == 'waiting' %>
+              <% classes << 'bg-primary' if a[:state] == 'allocated' %>
+              <% classes << 'bg-success' if a[:state] == 'busy' %>
+              <% classes << 'bg-secondary' if a[:state] == 'closed' %>
+              <span class="<%= classes.join(' ') %>"><%= a[:state] %></span>
+            </td>
+            <td>
+              <code style="font-weight: bold; color: black;"><%= a[:worker_hostname] %></code>
+            </td>
+            <td>
+              <code class="text-dark"><%= a[:created].strftime('%Y-%m-%d %H:%M:%SZ') %></code>
+              <span style="font-style: italic; opacity: 0.6;">
+                (<%= Duration.new(seconds: Time.now - a[:created]) %> ago)
+              </span>
+            </td>
+            <td>
+              <% now = Time.now %>
+              <% now = a[:allocated] if a[:allocated] %>
+              <%= Duration.new(seconds: now - a[:created]) %>
+            </td>
+            <td>
+              <% if a[:allocated] %>
+              <% now = Time.now %>
+              <% now = a[:closed] if a[:closed] %>
+              <%= Duration.new(seconds: now - a[:allocated]) %>
+              <% end %>
+            </td>
+            <td>
+              <% if a[:last_connect] %>
+              <%= Duration.new(seconds: Time.now - a[:last_connect]) %> ago
+              <% end %>
+            </td>
+          </tr>
+          <% end %>
+          <% if @allocations.empty? %>
+          <tr>
+            <td colspan="9" style="font-style: italic; opacity: 0.6;">(no active allocations)</td>
+          <% end %>
+        </tbody>
+      </table>
+
+      <hr/>
+      <h2>Budget</h2>
+      <div class="mb-5 mt-4 row">
+        <div class="col">
+          <div class="card ms-2 me-2">
+            <div class="card-header">
+              <%= @budget[:name] %>
+            </div>
+            <div class="vstack card-body">
+              <div class="progress">
+                <% classes = %w{progress-bar} %>
+                <% classes << 'bg-warning' if @budget[:actual] > 0.75 * @budget[:total] %>
+                <% classes << 'bg-danger' if @budget[:actual] > 0.9 * @budget[:total] %>
+                <% percent = (100 * @budget[:actual] / @budget[:total]).round.clamp(1,100) %>
+                <div class="<%= classes.join(' ') %>" role="progressbar" aria-valuenow="<%= @budget[:actual] %>" aria-valuemin="0" aria-valuemax="<%= @budget[:total] %>" style="width: <%= percent %>%;">
+                </div>
+              </div>
+              <div>
+                USD $<%= "%.02f" % [@budget[:actual]] %>
+                <span style="font-style: italic; opacity: 0.7;">
+                  /
+                  USD $<%= "%.02f" % [@budget[:total]] %>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col">
+          <div class="card ms-2 me-2">
+            <div class="card-header">
+              Spend per quota hour
+            </div>
+            <div class="card-body vstack">
+              <% c_added_per_hour = @config.find { |c| c[:key] == 'quota_mins_added_per_hour' } %>
+              <% c_eos = @config.find { |c| c[:key] == 'end_of_semester' } %>
+              <% time_left = (DateTime.parse(c_eos[:value]) - DateTime.now).to_f * 24 %>
+              <% tbi_quota_mins = c_added_per_hour[:value].to_f * time_left * @quotas.size %>
+              <% tgt_spend_per_qmin = @budget[:total] / (@budget[:total_quota_mins] + tbi_quota_mins) %>
+              <% spend_per_qmin = @budget[:actual] / @budget[:total_used_mins] %>
+              <div>
+                <table class="table table-sm">
+                  <tr>
+                    <th>Quota hours issued</th>
+                    <td><%= "%.01f" % [@budget[:total_quota_mins] / 60.0] %></td>
+                  </tr>
+                  <tr>
+                    <th>Quota hours used</th>
+                    <td><%= "%.01f" % [@budget[:total_used_mins] / 60.0] %></td>
+                  </tr>
+                  <tr>
+                    <th>Time left in semester</th>
+                    <td><%= Duration.new(hours: time_left) %></td>
+                  </tr>
+                  <tr>
+                    <th>Quota hours TBI</th>
+                    <td><%= "%.02f" % [tbi_quota_mins / 60.0] %></td>
+                  </tr>
+                  <tr>
+                    <th>Budget per quota hour</th>
+                    <td>
+                      <span style="font-size: 0.9em;">
+                      $<%= "%.02f" % [@budget[:total]] %> /
+                      (<%= "%.02f" % [@budget[:total_quota_mins] / 60.0] %>
+                      + <%= "%.02f" % [tbi_quota_mins / 60] %>) hrs
+                      </span>
+                      = <b>$<%= "%.02f" % [tgt_spend_per_qmin * 60] %></b> per hr</td>
+                  </tr>
+                  <tr>
+                    <th>Spend per used hour</th>
+                    <td>
+                      <span style="font-size: 0.9em;">
+                        $<%= "%.02f" % [@budget[:actual]] %>
+                        / <%= "%.02f" % [@budget[:total_used_mins] / 60.0] %> hrs
+                      </span>
+                      = <b>$<%= "%.02f" % [spend_per_qmin * 60] %></b> per hr
+                    </td>
+                  </tr>
+                  <tr>
+                    <th>Projected max spend</th>
+                    <td>
+                      <% max_spend = spend_per_qmin * (@budget[:total_quota_mins] + tbi_quota_mins) %>
+                      <span style="font-size: 0.9em;">
+                      $<%= "%.02f" % [spend_per_qmin * 60] %> per hr *
+                      (<%= "%.02f" % [@budget[:total_quota_mins] / 60.0] %>
+                      + <%= "%.02f" % [tbi_quota_mins / 60] %>) hrs
+                      </span>
+                      = USD <b>$<%= "%.02f" % [max_spend] %></b></td>
+                    </td>
+                  </tr>
+                </table>
+              </div>
+              <div class="progress">
+                <% percent = (100 * spend_per_qmin / tgt_spend_per_qmin).round %>
+                <% low_chunk = (percent / 2).round.clamp(1, 50) %>
+                <% high_chunk = ((percent / 2).round - 50).clamp(0, 50) %>
+                <div class="progress-bar" role="progressbar" style="width: <%= low_chunk %>%;">
+                </div>
+                <% if high_chunk > 0 %>
+                <div class="progress-bar bg-danger" role="progressbar" style="width: <%= high_chunk %>%;">
+                </div>
+                <% end %>
+              </div>
+              <div>
+                USD <b>$<%= "%.02f" % [spend_per_qmin * 60] %></b> per hr
+                <span style="font-style: italic; opacity: 0.7;">
+                    /
+                    USD $<%= "%.02f" % [tgt_spend_per_qmin * 60] %> per hr
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <hr/>
+      <h2>Quota</h2>
+      <table class="table table-striped">
+        <thead>
+          <tr>
+            <th style="width: 12em;">User/zone</th>
+            <th class="d-none d-lg-table-cell" style="width: 7em;">Conns</th>
+            <th class="d-none d-lg-table-cell" style="width: 12em;">Last active</th>
+            <th style="width: 20%">Time quota remaining</th>
+            <th style="width: 15%">Disk used (<code>home</code>)</th>
+            <th style="width: 15%">Disk used (<code>conda</code>)</th>
+            <th style="width: 15%">Disk used (<code>cache</code>)</th>
+            <th style="width: 12em;">Actions</th>
+        </thead>
+        <tbody>
+          <% @quotas.each do |q| %>
+          <% rem = q[:quota_mins] - q[:used_mins] %>
+          <% time_warning = q[:used_mins] > 0.75 * q[:quota_mins] or rem < 12*60 %>
+          <% time_danger = q[:used_mins] > 0.9 * q[:quota_mins] or rem < 2*60 %>
+          <% rowclass = [] %>
+          <% rowclass << 'table-warning' if time_warning %>
+          <% rowclass << 'table-danger' if time_danger %>
+          <tr class="<%= rowclass.join(' ') %>">
+            <td>
+              <code style="font-weight: bold; color: black;"><%= q[:username] %></code><br/>
+              <% shortid = q[:zone_id].split('-').first %>
+              on <a href="https://comp4703-<%= shortid %>.uqcloud.net"><code><%= shortid %></code></a>
+            </td>
+            <td class="d-none d-lg-table-cell">
+              <%= q[:active] %> / <%= q[:total] %>
+            </td>
+            <td class="d-none d-lg-table-cell">
+              <% if not q[:last_connect] %>
+                never
+              <% else %>
+                <%= Duration.new(seconds: Time.now - q[:last_connect]) %> ago
+              <% end %>
+            </td>
+            <td>
+              <div class="progress">
+                <% classes = %w{progress-bar} %>
+                <% classes << 'bg-warning' if time_warning %>
+                <% classes << 'bg-danger' if time_danger %>
+                <% percent = 100 - (100 * q[:used_mins] / q[:quota_mins]).round.clamp(1,100) %>
+                <div class="<%= classes.join(' ') %>" role="progressbar" aria-valuenow="<%= q[:used_mins] %>" aria-valuemin="0" aria-valuemax="<%= q[:quota_mins] %>" style="width: <%= percent %>%;">
+                </div>
+              </div>
+              <% if rem > 60 %>
+                <b><%= (rem / 60).floor %></b>h
+                <% rem %= 60 %>
+              <% end %>
+              <b><%= rem.floor %></b>m
+              <span style="font-style: italic; opacity: 0.7;">
+                /
+                <% rem = q[:quota_mins] %>
+                <% if rem > 60 %>
+                  <%= (rem / 60).floor %>h
+                  <% rem %= 60 %>
+                <% end %>
+                <%= rem.floor %>m
+              </span>
+            </td>
+            <% [[:home_used_mb, :home_quota_gb], [:conda_used_mb, :conda_quota_gb], [:cache_used_mb, :cache_quota_gb]].each do |uprop, qprop| %>
+            <td>
+              <div class="progress">
+                <% classes = %w{progress-bar} %>
+                <% quota = q[qprop] * 1024 %>
+                <% used = q[uprop] %>
+                <% classes << 'bg-warning' if used > 0.75 * quota %>
+                <% classes << 'bg-danger' if used > 0.9 * quota %>
+                <% percent = (100 * used / quota).round.clamp(2,100) %>
+                <div class="<%= classes.join(' ') %>" role="progressbar" aria-valuenow="<%= q[:used_mins] %>" aria-valuemin="0" aria-valuemax="<%= q[:quota_mins] %>" style="width: <%= percent %>%;">
+                </div>
+              </div>
+              <%= (q[uprop] / 102.4).round / 10.0 %>GB
+              <span style="font-style: italic; opacity: 0.7;">
+                /
+                <%= q[qprop] %>GB
+              </span>
+            </td>
+            <% end %>
+            <td class="vstack gap-2">
+              <a href="/admin/quota/<%= q[:username] %>?return_to=/admin" class="btn btn-secondary btn-sm">edit quota</a>
+              <a href="/admin/sessions/<%= q[:zone_id] %>" class="btn btn-secondary btn-sm">show sessions</a>
+            </td>
+          </tr>
+          <% end %>
+        </tbody>
+      </table>
+    </div>
+    <script src="/static/bootstrap.bundle.min.js"></script>
+    <script src="/static/d3.v7.min.js"></script>
+    <script>
+      const data = <%= @poolhistjson %>;
+
+      const width = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0) / 2;
+      const height = 200;
+      const marginTop = 30, marginRight = 30, marginLeft = 40, marginBottom = 30;
+
+      var maxTotal;
+      data.forEach(function (d) {
+        d.time = new Date(d.time);
+        /* correct the timezone, db returns utc */
+        d.time.setTime(d.time.getTime() + 1000*3600*10);
+        if (maxTotal === undefined || d.total > maxTotal)
+          maxTotal = d.total;
+      });
+
+      const x = d3.scaleUtc()
+        .domain(d3.extent(data, d => d.time))
+        .range([marginLeft, width - marginRight]);
+
+      const y = d3.scaleLinear()
+        .domain([0, maxTotal])
+        .range([height - marginBottom, marginTop]);
+
+      const area = d3.area()
+        .curve(d3.curveStep)
+        .x(d => x(d.time))
+        .y0(y(0))
+        .y1(d => y(d.total));
+
+      const busyArea = d3.area()
+        .curve(d3.curveStep)
+        .x(d => x(d.time))
+        .y0(y(0))
+        .y1(d => y(d.total - d.spares));
+
+      const svg = d3.create("svg")
+        .attr("width", width)
+        .attr("height", height);
+
+      const yAxis = svg.append("g")
+        .attr("transform", `translate(${marginLeft},0)`)
+        .call(d3.axisLeft(y).ticks(6).tickFormat(d3.format('.1f')));
+
+      const xAxis = svg.append("g")
+        .attr("transform", `translate(0,${height - marginBottom})`)
+        .call(d3.axisBottom(x).ticks(20).tickSizeOuter(0));
+
+      svg.append("path")
+        .datum(data)
+        .attr("fill", "#aad")
+        .attr("opacity", "0.5")
+        .attr("d", area);
+
+      svg.append("path")
+        .datum(data)
+        .attr("fill", "#d77")
+        .attr("d", busyArea);
+
+      document.getElementById('worker-graph').append(svg.node());
+    </script>
+  </body>
+</html>

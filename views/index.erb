@@ -1,45 +1,512 @@
 <!doctype html>
 <html lang="en">
   <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Bootstrap demo</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="refresh" content="300" />
+    <title>COMP4703 GPU usage</title>
     <link rel="stylesheet" href="/static/bootstrap.min.css" />
   </head>
-  <body>
+  <body class="bg-light-subtle">
     <div class="container">
-      <h1>COMP4703 GPU control for <%= @auth.key_info[:user] %></h1>
+      <h1 class="display-1">COMP4703 GPU usage</h1>
 
-      <h3>Quota</h3>
-      <div class="progress">
-        <% classes = %w{progress-bar progress-bar-striped} %>
-        <% classes << 'bg-warning' if @quota[:used_mins] > 0.75 * @quota[:quota_mins] %>
-        <% classes << 'bg-danger' if @quota[:used_mins] > 0.9 * @quota[:quota_mins] %>
-        <% percent = 100 * @quota[:used_mins] / @quota[:quota_mins] %>
-        <div class="<%= classes.join(' ') %>" role="progressbar" aria-valuenow="<%= @quota[:used_mins] %>" aria-valuemin="0" aria-valuemax="<%= @quota[:quota_mins] %>" style="width: <%= percent %>%;">
-        </div>
-      </div>
-      <table class="table">
-        <tr>
-          <th scope="row">Time quota</th>
-          <td><%= @quota[:quota_mins] %> minutes</td>
-        </tr>
-        <tr>
-          <th scope="row">Used</th>
-          <td><%= @quota[:used_mins] %> minutes</td>
-        </tr>
-        <tr>
-          <th scope="row">Remaining</th>
-          <td><%= @quota[:quota_mins] - @quota[:used_mins] %> minutes</td>
-        </tr>
-      </table>
+      <% if @auth.key_info[:admin] %>
+      <p style="font-style: italic;">This is <%= @zone[:owner] %>'s user panel; you can also access the <a href="/admin">admin panel</a><% if not @sudo %>, or the <a href="/admin/sessions/<%= @zone[:id] %>">more detailed admin view of this page</a><% end %>.</p>
+      <% end %>
 
+      <% if not @sudo %>
+      <hr/>
       <h3>My zone</h3>
       <p>Your zone is <a href="<%= @zone[:url] %>"><%= @zone[:alias] %></a>.</p>
+      <% end %>
 
-      <h3>My sessions</h3>
-      <p>Current sessions:</p>
-      <table class="table">
+      <hr/>
+      <h3>
+        Quota
+        <% if @auth.key_info[:admin] %>
+        <a class="btn btn-primary btn-sm" href="/admin/quota/<%= @zone[:owner] %>?return_to=<%= request.path %>">Edit</a>
+        <% end %>
+      </h3>
+      <table class="table mb-5">
+        <tr>
+          <th scope="row" style="width: 25%;">Time quota remaining</th>
+          <td>
+            <% rem = @quota[:quota_mins] - @quota[:used_mins] %>
+            <%= Duration.new(minutes: rem, largest_unit: :hours) %> remaining
+            <span style="font-style: italic; opacity: 0.7;">
+              /
+              <%= Duration.new(minutes: @quota[:quota_mins], largest_unit: :hours) %>
+            </span>
+            <div class="progress">
+              <% classes = %w{progress-bar} %>
+              <% classes << 'bg-warning' if @quota[:used_mins] > 0.75 * @quota[:quota_mins] or rem < 60*12 %>
+              <% classes << 'bg-danger' if @quota[:used_mins] > 0.9 * @quota[:quota_mins] or rem < 60*2 %>
+              <% percent = (100 * rem / @quota[:quota_mins]).round.clamp(1,100) %>
+              <div class="<%= classes.join(' ') %>" role="progressbar" aria-valuenow="<%= @quota[:used_mins] %>" aria-valuemin="0" aria-valuemax="<%= @quota[:quota_mins] %>" style="width: <%= percent %>%;">
+              </div>
+            </div>
+          </td>
+        </tr>
+        <% disk_quotas = [
+          {path: '/home/comp4703', used: :home_used_mb, quota: :home_quota_gb},
+          {path: '/home/comp4703/.cache', used: :cache_used_mb, quota: :cache_quota_gb},
+          {path: '/conda', used: :conda_used_mb, quota: :conda_quota_gb}
+          ] %>
+        <% disk_quotas.each do |q| %>
+        <tr>
+          <th scope="row">Disk usage<br/><code><%= q[:path] %></code></th>
+          <td>
+            <%= @quota[q[:used]] %> MB used
+            <span style="font-style: italic; opacity: 0.7;">/
+            <%= @quota[q[:quota]] %> GB</span>
+            <div class="progress">
+              <% classes = %w{progress-bar} %>
+              <% used_mb = @quota[q[:used]] %>
+              <% quota_mb = @quota[q[:quota]] * 1024 %>
+              <% classes << 'bg-warning' if used_mb > 0.75 * quota_mb %>
+              <% classes << 'bg-danger' if used_mb > 0.9 * quota_mb %>
+              <% percent = (100 * used_mb / quota_mb).round.clamp(1, 100) %>
+              <div class="<%= classes.join(' ') %>" role="progressbar" aria-valuenow="<%= used_mb %>" aria-valuemin="0" aria-valuemax="<%= quota_mb %>" style="width: <%= percent %>%;">
+              </div>
+            </div>
+          </td>
+        </tr>
+        <% end %>
+      </table>
+
+
+      <h3>Open sessions</h3>
+      <table class="table table-striped mb-5">
+        <% (@allocations + [nil]).each do |alloc| %>
+        <thead>
+          <tr>
+            <th style="width: 5em;">ID</th>
+            <th style="width: 7em;">Zone</th>
+            <th>GPU node</th>
+            <th style="width: 8em;">State</th>
+            <th>Created</th>
+            <th>Queued for</th>
+            <th>Running for</th>
+            <th>Connected</th>
+        </thead>
+        <% next unless alloc %>
+        <tbody>
+          <% ars = @alloc_reports[alloc[:id]] %>
+          <% ss = @sessions[alloc[:id]] %>
+          <% classes = [] %>
+          <% classes << 'bg-light' if ars.size > 0 or ss.size > 0 %>
+          <tr class="<%= classes.join(' ') %>">
+            <td><%= alloc[:id] %></td>
+            <td><code><%= alloc[:zone_id].split('-').first %></code></td>
+            <td><code><%= alloc[:worker_hostname] %></code></td>
+            <td>
+              <% classes = %w{badge} %>
+              <% classes << 'bg-danger' if alloc[:state] == 'allocated' %>
+              <% classes << 'bg-success' if alloc[:state] == 'busy' %>
+              <% alloc[:state] = 'idle (allocated)' if alloc[:state] == 'allocated' %>
+              <div class="<%= classes.join(' ') %>"><%= alloc[:state] %></div>
+            </td>
+            <td>
+              <code class="d-none d-lg-inline text-dark"><%= alloc[:created].strftime('%Y-%m-%d %H:%M:%SZ') %></code>
+              <span style="font-style: italic; opacity: 0.6;">
+                (<%= Duration.new(seconds: Time.now - alloc[:created]) %> ago)
+              </span>
+            </td>
+            <td>
+              <% if alloc[:allocated] %>
+              <%= Duration.new(seconds: alloc[:allocated] - alloc[:created]) %>
+              <% else %>
+              <span style="font-style: italic; opacity: 0.7;">
+                <%= Duration.new(seconds: Time.now - alloc[:created]) %>
+              </span>
+              <% end %>
+            </td>
+            <td>
+              <% if alloc[:allocated] %>
+              <%= Duration.new(seconds: Time.now - alloc[:allocated]) %>
+              <% end %>
+            </td>
+            <td>
+              <% if alloc[:last_connect] %>
+              <%= Duration.new(seconds: Time.now - alloc[:last_connect]) %> ago
+              <% end %>
+            </td>
+          </tr>
+
+          <% if ars and not ars.empty? %>
+            <% ards = (ars.size > 10) ? ars.slice(-10..) : ars %>
+            <tr style="opacity: 0.7">
+              <td class="me-5 border-end">
+                <div style="transform: rotate(-90deg); margin-top: 2em; font-style: italic; text-align: right;">
+                  Status Reports
+                </div>
+              </td>
+              <td colspan="7" class="border-end">
+                <table class="table table-striped table-sm">
+                  <thead>
+                    <tr>
+                      <th style="width: 10em">When</th>
+                      <th class="d-none d-lg-table-cell" style="width: 6em"></th>
+                      <th style="width: 7em"></th>
+                      <th style="width: 5em">State</th>
+                      <th style="width: 12em">Reason</th>
+                      <th>Info</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <% if ars.size > ards.size %>
+                    <tr>
+                      <td class="bg-white text-dark border-dark" colspan="6" style="border-style: dashed; text-align: center; font-style: italic;">
+                        (<%= ars.size - ards.size %> earlier reports hidden)
+                      </td>
+                    </tr>
+                    <% end %>
+                    <% ards.each do |ar| %>
+                    <tr>
+                      <td>
+                        <code class="text-dark"><%= ar[:time].strftime('%d/%m %H:%M:%SZ') %></code>
+                      </td>
+                      <td class="d-none d-lg-table-cell" style="font-size: 0.8em; font-style: italic; line-height: 1.9em;">
+                        <%= Duration.new(seconds: Time.now - ar[:time]) %> ago
+                      </td>
+                      <td style="font-size: 0.8em; line-height: 1.9em; font-style: italic;">
+                        T+ <%= Duration.new(seconds: ar[:time] - alloc[:allocated]) %>
+                      </td>
+                      <td>
+                        <% classes = %w{badge} %>
+                        <% classes << 'bg-primary' if ar[:type] == 'busy' %>
+                        <% classes << 'bg-danger' if ar[:type] == 'idle' %>
+                        <div class="<%= classes.join(' ') %>"><%= ar[:type] %></div>
+                      </td>
+                      <td><b><code><%= ar[:reason] %></code></b></td>
+                      <td>
+                        <% if ar[:data].empty? %>
+                          <span style="font-size: 0.8em; font-style: italic;">
+                            (no extra info)
+                          </span>
+                        <% else %>
+                          <% ar[:data].each do |k,v| %>
+                          <div class="badge border border-secondary text-secondary">
+                            <b><%= k %></b> = <code><%= v %></code>
+                          </div>
+                          <% end %>
+                        <% end %>
+                      </td>
+                    </tr>
+                    <% end %>
+                  </tbody>
+                </table>
+              </td>
+            </tr>
+          <% end %>
+
+          <% if ss and not ss.empty? %>
+            <% sss = (ss.size > 10) ? ss.slice(-10..) : ss %>
+            <tr style="opacity: 0.7">
+              <td class="me-5 border-end">
+                <div style="transform: rotate(-90deg); margin-top: 2em; font-style: italic; text-align: right;">
+                  SSH Connects
+                </div>
+              </td>
+              <td colspan="7" class="border-end">
+                <table class="table table-striped table-sm">
+                  <thead>
+                    <tr>
+                      <th style="width: 10em">Started</th>
+                      <th style="width: 8em"></th>
+                      <th style="width: 10em">Stopped</th>
+                      <th style="width: 8em"></th>
+                      <th style="width: 8em">Duration</th>
+                      <th>State</th>
+                      <th>Error msg</th>
+                      <th>Comment</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <% if ss.size > sss.size %>
+                    <tr>
+                      <td class="bg-white text-dark border-dark" colspan="4" style="border-style: dashed; text-align: center; font-style: italic;">
+                        (<%= ss.size - sss.size %> earlier sessions hidden)
+                      </td>
+                    </tr>
+                    <% end %>
+                    <% sss.each do |s| %>
+                    <tr>
+                      <td>
+                        <code class="text-dark"><%= s[:created_at].strftime('%d/%m %H:%M:%SZ') %></code>
+                      </td>
+                      <td style="font-style: italic; font-size: 0.8em; line-height: 1.9em;">
+                        T+ <%= Duration.new(seconds: s[:created_at] - alloc[:allocated]) %>
+                      </td>
+                      <td>
+                        <% if s[:stopped_at] %>
+                          <code class="text-dark"><%= s[:stopped_at].strftime('%d/%m %H:%M:%SZ') %></code>
+                        <% else %>
+                          <span style="font-style: italic; opacity: 0.7;">
+                            (still open)
+                          </span>
+                        <% end %>
+                      </td>
+                      <td style="font-style: italic; font-size: 0.8em; line-height: 1.9em;">
+                        <% if s[:stopped_at] %>
+                        T+ <%= Duration.new(seconds: s[:stopped_at] - alloc[:allocated]) %>
+                        <% end %>
+                      </td>
+                      <td>
+                        <% if s[:stopped_at] %>
+                        <%= Duration.new(seconds: s[:stopped_at] - s[:created_at]) %>
+                        <% end %>
+                      </td>
+                      <td>
+                        <% classes = %w{badge} %>
+                        <% classes << 'bg-primary' if s[:status] == 'active' %>
+                        <% classes << 'bg-danger' if s[:status] == 'closed' %>
+                        <div class="<%= classes.join(' ') %>"><%= s[:status] %></div>
+                      </td>
+                      <td>
+                        <% if s[:err_msg] and s[:err_msg].strip.size > 0 %>
+                          <%= s[:err_msg] %>
+                        <% else %>
+                          &mdash;
+                        <% end %>
+                      </td>
+                      <td>
+                        <% if s[:comment] and s[:comment].strip.size > 0 %>
+                          <%= s[:comment] %>
+                        <% else %>
+                          &mdash;
+                        <% end %>
+                      </td>
+                    </tr>
+                    <% end %>
+                  </tbody>
+                </table>
+              </td>
+            </tr>
+          <% end %>
+        </tbody>
+        <% end %>
+        <% if @allocations.empty? %>
+        <tbody>
+          <tr>
+            <td colspan="8" style="text-align: center; font-style: italic; opacity: 0.8;">
+              (no open sessions found)
+            </td>
+          </tr>
+        </tbody>
+        <% end %>
+      </table>
+
+
+      <h3>Past sessions</h3>
+      <% show_thead = true %>
+      <table class="table mb-3 table-striped">
+        <% (@past_allocations + [nil]).each do |alloc| %>
+        <% if show_thead %>
+          <thead style="border-top-color: #999;" class="table-group-divider">
+            <tr>
+              <th style="width: 5em;">ID</th>
+              <th style="width: 7em;">Zone</th>
+              <th style="width: 11em;">GPU node</th>
+              <th>Created at</th>
+              <th>Queued for</th>
+              <th>Ran for</th>
+              <th>Ended at</th>
+            </tr>
+          </thead>
+          <% show_thead = false %>
+        <% end %>
+        <% next unless alloc %>
+        <tbody>
+          <tr>
+            <td><%= alloc[:id] %></td>
+            <td><code><%= alloc[:zone_id].split('-').first %></code></td>
+            <td><code><%= alloc[:worker_hostname] %></code></td>
+            <td>
+              <code class="text-dark"><span class="d-none d-lg-inline"><%= alloc[:created].year %>-</span><%= alloc[:created].strftime('%m-%d %H:%M:%SZ') %></code>
+            </td>
+            <td><%= Duration.new(seconds: (alloc[:allocated] - alloc[:created]).round) %></td>
+            <td><%= Duration.new(seconds: (alloc[:closed] - alloc[:allocated]).round) %></td>
+            <td>
+              <code class="text-dark"><span class="d-none d-lg-inline"><%= alloc[:created].year %>-</span><%= alloc[:closed].strftime('%m-%d %H:%M:%SZ') %></code>
+              <span style="font-style: italic; opacity: 0.5">
+                (<%= Duration.new(seconds: Time.now - alloc[:created]) %> ago)
+              </span>
+            </td>
+          </tr>
+
+          <% ars = @alloc_reports[alloc[:id]] %>
+          <% if ars and not ars.empty? %>
+            <% show_thead = true %>
+            <% ards = (ars.size > 10) ? ars.slice(-10..) : ars %>
+            <tr style="opacity: 0.7;">
+              <td class="me-5 border-end">
+                <div style="transform: rotate(-90deg); margin-top: 2em; font-style: italic; text-align: right;">
+                  Status Reports
+                </div>
+              </td>
+              <td colspan="6" class="border-end">
+                <table class="table table-striped table-sm">
+                  <thead>
+                    <tr>
+                      <th style="width: 10em">When</th>
+                      <th style="width: 10%"></th>
+                      <th style="width: 6em">State</th>
+                      <th style="width: 12em">Reason</th>
+                      <th>Info</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <% if ars.size > ards.size %>
+                    <tr>
+                      <td class="bg-white text-dark border-dark" colspan="6" style="border-style: dashed; text-align: center; font-style: italic;">
+                        (<%= ars.size - ards.size %> earlier reports hidden)
+                      </td>
+                    </tr>
+                    <% end %>
+                    <% ards.each do |ar| %>
+                    <tr>
+                      <td>
+                        <code class="text-dark"><%= ar[:time].strftime('%d/%m %H:%M:%SZ') %></code>
+                      </td>
+                      <td style="font-size: 0.8em; line-height: 1.8em; font-style: italic;">
+                        T+ <%= Duration.new(seconds: ar[:time] - alloc[:allocated]) %>
+                      </td>
+                      <td>
+                        <% classes = %w{badge} %>
+                        <% classes << 'bg-primary' if ar[:type] == 'busy' %>
+                        <% classes << 'bg-danger' if ar[:type] == 'idle' %>
+                        <div class="<%= classes.join(' ') %>"><%= ar[:type] %></div>
+                      </td>
+                      <td><b><code><%= ar[:reason] %></code></b></td>
+                      <td>
+                        <% if ar[:data].empty? %>
+                          <span style="font-size: 0.8em; font-style: italic;">
+                            (no extra info)
+                          </span>
+                        <% else %>
+                          <% ar[:data].each do |k,v| %>
+                          <div class="badge border border-secondary text-secondary">
+                            <b><%= k %></b> = <code><%= v %></code>
+                          </div>
+                          <% end %>
+                        <% end %>
+                      </td>
+                    </tr>
+                    <% end %>
+                  </tbody>
+                </table>
+              </td>
+            </tr>
+          <% end %>
+
+          <% ss = @sessions[alloc[:id]] %>
+          <% if ss and not ss.empty? %>
+            <% show_thead = true %>
+            <% sss = (ss.size > 10) ? ss.slice(-10..) : ss %>
+            <tr style="opacity: 0.7">
+              <td class="me-5 border-end">
+                <div style="transform: rotate(-90deg); margin-top: 2em; font-style: italic; text-align: right;">
+                  SSH Connects
+                </div>
+              </td>
+              <td colspan="7" class="border-end">
+                <table class="table table-striped table-sm">
+                  <thead>
+                    <tr>
+                      <th style="width: 10em">Started</th>
+                      <th style="width: 8em"></th>
+                      <th style="width: 10em">Stopped</th>
+                      <th style="width: 8em"></th>
+                      <th style="width: 8em">Duration</th>
+                      <th>State</th>
+                      <th>Error msg</th>
+                      <th>Comment</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <% if ss.size > sss.size %>
+                    <tr>
+                      <td class="bg-white text-dark border-dark" colspan="4" style="border-style: dashed; text-align: center; font-style: italic;">
+                        (<%= ss.size - sss.size %> earlier sessions hidden)
+                      </td>
+                    </tr>
+                    <% end %>
+                    <% sss.each do |s| %>
+                    <tr>
+                      <td>
+                        <code class="text-dark"><%= s[:created_at].strftime('%d/%m %H:%M:%SZ') %></code>
+                      </td>
+                      <td style="font-style: italic; font-size: 0.8em; line-height: 1.9em;">
+                        T+ <%= Duration.new(seconds: s[:created_at] - alloc[:allocated]) %>
+                      </td>
+                      <td>
+                        <% if s[:stopped_at] %>
+                          <code class="text-dark"><%= s[:stopped_at].strftime('%d/%m %H:%M:%SZ') %></code>
+                        <% else %>
+                          <span style="font-style: italic; opacity: 0.7;">
+                            (still open)
+                          </span>
+                        <% end %>
+                      </td>
+                      <td style="font-style: italic; font-size: 0.8em; line-height: 1.9em;">
+                        <% if s[:stopped_at] %>
+                        T+ <%= Duration.new(seconds: s[:stopped_at] - alloc[:allocated]) %>
+                        <% end %>
+                      </td>
+                      <td>
+                        <% if s[:stopped_at] %>
+                        <%= Duration.new(seconds: s[:stopped_at] - s[:created_at]) %>
+                        <% end %>
+                      </td>
+                      <td>
+                        <% classes = %w{badge} %>
+                        <% classes << 'bg-primary' if s[:status] == 'active' %>
+                        <% classes << 'bg-danger' if s[:status] == 'closed' %>
+                        <div class="<%= classes.join(' ') %>"><%= s[:status] %></div>
+                      </td>
+                      <td>
+                        <% if s[:err_msg] and s[:err_msg].strip.size > 0 %>
+                          <%= s[:err_msg] %>
+                        <% else %>
+                          &mdash;
+                        <% end %>
+                      </td>
+                      <td>
+                        <% if s[:comment] and s[:comment].strip.size > 0 %>
+                          <%= s[:comment] %>
+                        <% else %>
+                          &mdash;
+                        <% end %>
+                      </td>
+                    </tr>
+                    <% end %>
+                  </tbody>
+                </table>
+              </td>
+            </tr>
+          <% end %>
+        </tbody>
+        <% end %>
+        <% if @past_allocations.empty? %>
+        <tbody>
+          <tr>
+            <td colspan="6" style="text-align: center; font-style: italic; opacity: 0.8;">
+              (no past sessions found)
+            </td>
+          </tr>
+        </tbody>
+        <% end %>
+        <% if @past_count > @past_allocations.size %>
+        <tbody>
+          <tr>
+            <td colspan="8" style="text-align: center; font-style: italic; opacity: 0.8;">
+              (<%= @past_count - @past_allocations.size %> older sessions not shown)
+            </td>
+          </tr>
+        </tbody>
+        <% end %>
       </table>
     </div>
     <script src="/static/bootstrap.bundle.min.js"></script>

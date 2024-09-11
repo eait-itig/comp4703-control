@@ -13,6 +13,7 @@ $lock = File.open(LOCK_FILE, File::CREAT)
 $lock.flock(File::LOCK_EX)
 
 $logfile = File.open(LOG_FILE, File::WRONLY | File::APPEND | File::CREAT | File::SYNC)
+$logfile.chmod(0600)
 $stderr = $logfile
 $log = Logger.new($logfile)
 $log.level = Logger::DEBUG
@@ -81,39 +82,72 @@ pgreps = nil
 begin
   pgreps = sh('pgrep -af -u comp4703')
 rescue Exception
-  if cdelta < Rational(5,24*60)
-    $log.info 'no processes running, but last connect was <5min ago'
-    exit 0
-  end
   $log.info 'no processes running, marking as idle'
-  sh('sdc-curl -s -XPOST http://<%= @myaddr %>:443/worker/idle')
+  json = JSON.dump({
+    reason: 'no-processes'
+  })
+  sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/idle")
   exit 0
 end
 
+state = :pwr
+gpu_info = {}
 sh('nvidia-smi').each do |line|
-  next unless line =~ /[ ]+([0-9]+)W[ ]*[^ ][ ]*([0-9]+)W[ ]*/
-  pwr_frac = $1.to_f / $2.to_f
-  if pwr_frac > 0.2
-    $log.info "not idle: GPU is using #{(pwr_frac * 100).round}% power"
-    sh('sdc-curl -s -XPOST http://<%= @myaddr %>:443/worker/busy')
-    sh("touch #{NONIDLE_STAMP}")
-    exit 0
-  else
-    $log.info "GPU is using #{(pwr_frac * 100).round}% power"
+  if state == :pwr
+    next unless line =~ /[ ]+([0-9]+)W[ ]*[^ ][ ]*([0-9]+)W[ ]*/
+    pwr_frac = $1.to_f / $2.to_f
+    gpu_info[:percent_gpu_pwr] = (pwr_frac * 100).round
+    if line =~ /[ ]+([0-9]+)MiB[ ]*[^ ][ ]*([0-9]+)MiB[ ]*/
+      mem_frac = $1.to_f / $2.to_f
+      gpu_info[:percent_gpu_mem] = (mem_frac * 100).round
+    end
+    $log.info "GPU is using #{gpu_info[:gpu_pwr_percent]}% power, #{gpu_info[:gpu_mem_percent]} memory"
+    state = :proc
+  elsif state == :proc
+    next unless line =~ /^[\s|]+Processes:[\s|]+$/
+    state = :proc_bar
+  elsif state == :proc_bar
+    next unless line =~ /^[ |]+[=]+[ |]+$/
+    state = :proc_info
+  elsif state == :proc_info
+    if line =~ /^[ ]*[+][-]+[+][ ]*$/
+      state = :done
+      next
+    end
+    next unless line =~ /^[ ]*[|][ ]*([^|]+)[ ]*[|][ ]*$/
+    fields = $1.split
+    next unless fields.size >= 7 and fields[3] =~ /^[0-9]+$/ and fields[4] =~ /^[A-Z]+$/
+    gpu_info[:pid] = fields[3].to_i
+    gpu_info[:execname] = fields.slice(5..).slice(..-2).join(' ')
   end
 end
 
+if gpu_info[:percent_gpu_pwr] > 20 or gpu_info[:percent_gpu_mem] > 30
+  $log.info "not idle: GPU is busy"
+  gpu_info[:reason] = 'busy-gpu'
+  json = JSON.dump(gpu_info)
+  sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/busy")
+  sh("touch #{NONIDLE_STAMP}")
+  exit 0
+end
+
 got_headings = 0
-sh('top -bn2 -U comp4703').each do |line|
+sh('top -bn2 -d10 -U comp4703').each do |line|
   fields = line.split.map { |f| f.strip }
   if got_headings < 2
     next unless fields[0] == 'PID' and fields[8] == '%CPU'
     got_headings += 1
     next
   end
-  if fields[8].to_f > 5.0
-    $log.info "not idle: pid #{fields[0]} (#{fields.last}) is using >10% cpu"
-    sh('sdc-curl -s -XPOST http://<%= @myaddr %>:443/worker/busy')
+  if fields[8].to_f > 2.0
+    $log.info "not idle: pid #{fields[0]} (#{fields.last}) is using >2% cpu"
+    json = JSON.dump({
+      reason: 'busy-process',
+      pid: fields[0].to_i,
+      execname: fields.last,
+      percent_cpu: fields[8].to_f
+    })
+    sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/busy")
     sh("touch #{NONIDLE_STAMP}")
     exit 0
   end
@@ -127,19 +161,44 @@ pgreps.each do |line|
   next if cmdline =~ /^-bash/
   next if cmdline =~ /^sshd:/
   next if cmdline =~ /^tmux/
-  next if cmdline =~ /jupyter/ or cmdline =~ /jupyter-lab/
   if (cmdline =~ /ipykernel/ or cmdline =~ /python/) and idelta < Rational(1, 24)
     $log.info "not idle: ipykernel running in pid #{pid}, cpu/gpu usage in last 1h"
-    sh('sdc-curl -s -XPOST http://<%= @myaddr %>:443/worker/busy')
+    json = JSON.dump({
+      reason: 'python-usage-1h',
+      pid: pid,
+      execname: cmdline
+    })
+    sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/busy")
     exit 0
   end
+  next if cmdline =~ /jupyter/ or cmdline =~ /jupyter-lab/
   next if cmdline =~ /ipykernel/ or cmdline =~ /python/
   if idelta < Rational(2, 24)
     $log.info "not idle: cpu/gpu usage in last 2h and '#{cmdline}' is running"
-    sh('sdc-curl -s -XPOST http://<%= @myaddr %>:443/worker/busy')
+    json = JSON.dump({
+      reason: 'other-proc-usage-2h',
+      pid: pid,
+      execname: cmdline
+    })
+    sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/busy")
     exit 0
   end
 end
 
 $log.info "marking idle in controller"
-sh('sdc-curl -s -XPOST http://<%= @myaddr %>:443/worker/idle')
+json = JSON.dump({
+  reason: 'timed-out'
+})
+sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/idle")
+
+6.times do
+  # let the balancer run again
+  sleep 5
+
+  out = sh('sdc-curl -s http://<%= @myaddr %>:443/worker/assignment').join("\n")
+  if out =~ /no valid assignment/
+    $log.info 'no valid assigment for this node, killing all procs'
+    sh('pkill -u comp4703', check: false)
+    sh('pkill -U comp4703', check: false)
+  end
+end

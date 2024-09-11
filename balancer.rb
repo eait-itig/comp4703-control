@@ -1,4 +1,5 @@
 require 'aws-sdk-ec2'
+require 'aws-sdk-budgets'
 require 'json'
 require 'base64'
 require 'socket'
@@ -17,7 +18,7 @@ ENV['SDC_KEY_ID'] = %x{ssh-add -l}.split("\n").first.split[1].strip
 ENV['SDC_ACCOUNT'] = %x{mdata-get sdc:owner_uuid}.strip
 ENV['SDC_USER'] = 'machine'
 
-$log = Logger.new(STDOUT)
+$log = Logger.new(STDERR)
 $log.level = Logger::DEBUG
 
 $db = PG.connect(dbname: 'control')
@@ -40,6 +41,7 @@ $vpcname = 'comp4703-vpn'
 $netname = 'comp4703-vpn'
 $sockpath = '/run/comp4703-balancer.sock'
 $ec2keyname = 'sshportal-default'
+$awsacct = '017820696081'
 
 r = $dbssh.exec_params('select * from ssh_keys where name = $1', ['default'])
 $default_keyid = r[0]['id']
@@ -56,7 +58,27 @@ $myaddr = vpnif[:ip]
 $ec2 = Aws::EC2::Client.new(profile: $profile)
 $ec2rsrc = Aws::EC2::Resource.new(client: $ec2)
 
+$budgets = Aws::Budgets::Client.new(profile: $profile)
+
 $alloc_sockmap = Hash.new([])
+
+def update_budgets
+  r = $budgets.describe_budgets(account_id: $awsacct)
+  $db.exec('begin')
+  $db.exec('truncate table budgets')
+  $db.prepare('insert-budget', 'insert into budgets
+    (name, total, actual, last_update) values ($1, $2, $3, $4)')
+  r.budgets.each do |b|
+    r = $db.exec_prepared('insert-budget', [
+      b.budget_name, b.budget_limit.amount.to_f,
+      b.calculated_spend.actual_spend.amount.to_f,
+      b.last_updated_time
+    ])
+    raise "failed to insert budget: #{b.inspect}" unless r.cmd_tuples == 1
+  end
+  $db.exec('deallocate "insert-budget"')
+  $db.exec('commit')
+end
 
 $last_zone_hash = nil
 def update_zone_keys
@@ -175,6 +197,8 @@ def rebalance
 
   update_zone_keys
 
+  update_budgets
+
   # first, reconcile AWS' list of worker instances with our db
   # make sure everything is up to date
   aws_workers = {}
@@ -199,6 +223,13 @@ def rebalance
     res.each do |row|
       row.symbolize!
       db_workers[row[:hostname]] = row
+    end
+  end
+  db_zones = {}
+  $db.exec('select * from zones') do |res|
+    res.each do |row|
+      row.symbolize!
+      db_zones[row[:id]] = row
     end
   end
 
@@ -254,6 +285,12 @@ def rebalance
     res.each do |row|
       row.symbolize!
 
+      if not db_zones[row[:zone_id]]
+        $log.error("allocation for #{row[:zone_id]} is still present but zone is gone")
+        unallocate row[:id]
+        next
+      end
+
       # collect all the 'waiting' allocations for us to use in the next step
       waiting << row if row[:state] == 'waiting'
       if row[:state] != 'waiting'
@@ -266,6 +303,8 @@ def rebalance
       allocated = row[:allocated].to_datetime
       next if DateTime.now - allocated < Rational(3, 24*60)
 
+      action = nil
+
       # first, update quota charging for this allocation
       charged = row[:allocated].to_datetime
       charged = row[:charged_until].to_datetime if row[:charged_until]
@@ -275,23 +314,27 @@ def rebalance
         $db.exec('begin')
         r = $db.exec_params('update quotas
           set used_mins = used_mins + $1
-          where username = (select coalesce(owner,\'\') from zones where id = $2)
+          where username = (select owner from zones where id = $2)
           returning username, used_mins, quota_mins', [mins, row[:zone_id]])
+        if r.ntuples == 0
+          $log.error("can't update quota for #{row[:zone_id]}?")
+          next
+        end
         quota = r[0].symbolize
         $db.exec_params('update allocations set
           charged_until = $1 where id = $2', [now, row[:id]])
         $db.exec('commit')
         if quota[:used_mins] > quota[:quota_mins]
           $log.info("user '#{quota[:username]}' is over quota, kicking them")
+          r = $dbssh.exec_params('select comment from users where id = $1',
+            [row[:ssh_user_id]])
+          action = :unallocate if r[0]['comment'] == 'DISABLED'
           $dbssh.exec_params('update users
             set comment = $1
             where id = $2',
             ['DISABLED', row[:ssh_user_id]])
         end
       end
-
-      # now work out if we can unallocate it or not
-      action = nil
 
       # work out the last time a connection was active on this allocation
       last_active = row[:last_connect] ? row[:last_connect].to_datetime : nil
@@ -369,24 +412,19 @@ def rebalance
   want = limit if want > limit
 
   r = $db.exec_params('select * from pool_size_history where time > $1',
-    [Time.now - 3600])
-  max_size = max_time = nil
+    [Time.now - 3*3600])
+  min_size = 1
   r.each do |sample|
     sample.symbolize!
-    if max_size.nil? or sample[:total] > max_size
-      max_time = sample[:time]
-      max_size = sample[:total]
-    end
-  end
-  min_size = 1
-  unless max_time.nil?
-    min_size = (max_size - ((Time.now - max_time) / 60.0) / pool_idle_mins.to_f).ceil
+    busy = sample[:total] - sample[:spares]
+    nmin_size = (busy + pool_spares - ((Time.now - sample[:time]) / 60.0) / pool_idle_mins.to_f).ceil
+    min_size = nmin_size if nmin_size > min_size
   end
 
   $db.exec_params('insert into pool_size_history (total, spares)
     values ($1, $2)', [total, spares])
   $db.exec_params('delete from pool_size_history where time <= $1',
-    [Time.now - 24*3600*7])
+    [Time.now - 24*3600*3])
 
   $log.debug("spares = %d, total = %d (want spares = %d, max = %d)" % [
     spares, total, pool_spares, pool_max])
@@ -433,26 +471,36 @@ def rebalance
 end
 
 def notify_alloc(alloc_id, state, do_any: true)
-  $alloc_sockmap[alloc_id].each do |sock|
-    begin
-      sock.puts JSON.dump({
-        :status => :ok,
-        :allocation => alloc_id,
-        :state => state
-      })
-    rescue
+  wsocks = $alloc_sockmap[alloc_id].reject { |s| s.closed? }
+  r = IO.select([], wsocks, [], 1)
+  if not r.nil?
+    _, socks, _ = r
+    socks.each do |sock|
+      begin
+        sock.puts JSON.dump({
+          :status => :ok,
+          :allocation => alloc_id,
+          :state => state
+        })
+      rescue Exception
+      end
     end
   end
   $alloc_sockmap.delete(alloc_id)
   return unless do_any
-  $alloc_sockmap[:any].each do |sock|
-    begin
-      sock.puts JSON.dump({
-        :status => :ok,
-        :allocation => alloc_id,
-        :state => state
-      })
-    rescue
+  wsocks = $alloc_sockmap[:any].reject { |s| s.closed? }
+  r = IO.select([], wsocks, [], 1)
+  if not r.nil?
+    _, socks, _ = r
+    socks.each do |sock|
+      begin
+        sock.puts JSON.dump({
+          :status => :ok,
+          :allocation => alloc_id,
+          :state => state
+        })
+      rescue Exception
+      end
     end
   end
   $alloc_sockmap.delete(:any)
@@ -502,6 +550,10 @@ def unallocate(alloc_id)
     [alloc[:ssh_host_group_id]])
   raise 'delete failed' unless r.cmd_tuples == 1
 
+  $dbssh.exec_params('insert into old_sessions
+    select *, $1 as allocation_id from sessions
+    where user_id = $2 or host_id = $3',
+    [alloc[:id], alloc[:ssh_user_id], alloc[:ssh_host_id]])
   $dbssh.exec_params('delete from sessions
     where user_id = $1 or host_id = $2',
     [alloc[:ssh_user_id], alloc[:ssh_host_id]])

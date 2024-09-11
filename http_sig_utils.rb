@@ -43,16 +43,28 @@ class RackMessageWrapper
 end
 
 class SSOVerification
-  def initialize(request:)
+  def initialize(request:, admin_users: [])
     @req = request
+    @admins = admin_users
+    @user = @req.get_header('HTTP_X_UQ_USER')
+    blob = @req.get_header('HTTP_X_KVD_PAYLOAD')
+    begin
+      @blob = JSON.parse(blob, :symbolize_names => true)
+    rescue Exception
+      @blob = nil
+    end
   end
 
   def valid?
-    true
+    not @user.nil? and not @blob.nil?
+  end
+
+  def is_admin?
+    @admins.include?(@user) or @blob[:groups].include?('eait:itig')
   end
 
   def key_info
-    {:type => :sso, :user => @req.get_header('HTTP_X_UQ_USER')}
+    {:type => :sso, :user => @user, :admin => is_admin?}
   end
 end
 
@@ -79,6 +91,11 @@ class AuthzVerification < HttpSignatures::Verification
     else
       false
     end
+  end
+
+  def signed_header?(hdr)
+    signedhdrs = header_list.to_a
+    signedhdrs.include?(hdr)
   end
 
   def valid?

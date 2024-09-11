@@ -2,10 +2,14 @@ require 'sinatra'
 require 'json'
 require 'pg'
 require 'ssh_data'
+require 'digest'
 require 'socket'
+require 'logger'
 require 'openssl'
 require 'connection_pool'
 require 'http_signatures'
+require 'sinatra/reloader'
+require 'duration'
 require './http_sig_ecdsa'
 require './http_sig_utils'
 require './utils'
@@ -13,6 +17,9 @@ require './utils'
 $sockpath = '/run/comp4703-balancer.sock'
 $mungekey = Base64.decode64('l3ypcbQpc4ksNdxIl+QehjUR')
 $ctrlzone = `zonename`.strip
+
+$log = Logger.new(STDERR)
+$log.level = Logger::DEBUG
 
 def rebalance
   begin
@@ -72,6 +79,15 @@ def allocate_and_wait(alloc_id)
   end
 end
 
+def get_config(key)
+  $db_pool.with do |db|
+    r = db.exec_params('select * from config
+      where key = $1', [key.to_s])
+    raise "Config key not found: #{key}" if r.ntuples < 1
+    r[0]['value']
+  end
+end
+
 $db_pool = ConnectionPool.new(size: 32) do
   db = PG.connect(dbname: 'control')
   db.type_map_for_results = PG::BasicTypeMapForResults.new db
@@ -88,11 +104,12 @@ end
 
 module Control
   class Application < Sinatra::Base
-    set :environment, :production
+    set :environment, :development
 
     before do
       if request.get_header('HTTP_X_UQ_USER')
-        @auth = SSOVerification.new(request: request)
+        xusers = get_config(:xusers).split
+        @auth = SSOVerification.new(request: request, admin_users: xusers)
       else
         keys = {}
         $db_pool.with do |db|
@@ -143,6 +160,188 @@ module Control
           and state != \'closed\'', [@zone[:id]])
         @allocations = []
         r.each { |a| @allocations << a.symbolize }
+
+        r = db.exec_params('select * from allocations where zone_id = $1
+          and state = \'closed\' order by closed desc limit $2',
+          [@zone[:id], 10])
+        @past_allocations = []
+        r.each { |a| @past_allocations << a.symbolize }
+        r = db.exec_params('select count(*) as count from allocations
+          where zone_id = $1 and state = \'closed\'', [@zone[:id]])
+        @past_count = r[0]['count']
+
+        @alloc_reports = {}
+        @sessions = {}
+      end
+      erb :index
+    end
+
+    get '/admin' do
+      halt 403, "access denied\r\n" unless @auth.valid? and @auth.key_info[:admin]
+      $db_pool.with do |db|
+        r = db.exec('select * from config order by key')
+        @config = []
+        r.each { |c| @config << c.symbolize }
+
+        r = db.exec('select * from budgets where name = $1',
+          ["comp4703-#{Time.now.year}"])
+        @budget = r[0].symbolize
+
+        r = db.exec('select sum(used_mins) as used, sum(quota_mins) as quota from quotas')
+        @budget[:total_used_mins] = r[0]['used']
+        @budget[:total_quota_mins] = r[0]['quota']
+
+        r = db.exec('
+          select
+            q.*,
+            z.id as zone_id,
+            sum(
+              case
+                when a.state is null then 0
+                when a.state = \'closed\' then 0
+                else 1
+              end
+            ) as active,
+            count(a.state) as total,
+            max(a.last_connect) as last_connect
+          from quotas as q
+          join zones as z on z.owner = q.username
+          left outer join allocations as a on a.zone_id = z.id
+          group by q.username, z.id
+          order by q.username desc')
+        @quotas = []
+        r.each { |q| @quotas << q.symbolize }
+
+        r = db.exec('select * from workers order by hostname')
+        @workers = []
+        r.each { |w| @workers << w.symbolize }
+
+        r = db.exec_params('select * from allocations
+          where (state != \'closed\' or closed >= $1)
+          order by created desc', [Time.now - 3600*3])
+        @allocations = []
+        r.each { |w| @allocations << w.symbolize }
+
+        r = db.exec('select * from zones order by id')
+        @zones = {}
+        r.each do |z|
+          z.symbolize!
+          @zones[z[:id]] = z
+        end
+
+        poolhist = []
+        r = db.exec('select * from pool_size_history order by time asc')
+        r.each { |row| poolhist << row.symbolize }
+        @poolhistjson = JSON.dump(poolhist)
+      end
+      erb :admin
+    end
+
+    get '/admin/quota/:user' do |user|
+      halt 403, "access denied\r\n" unless @auth.valid? and @auth.key_info[:admin]
+      $db_pool.with do |db|
+        r = db.exec_params('select * from quotas where username = $1', [user])
+        @quota = r[0].symbolize
+      end
+      erb :edit_quota
+    end
+
+    post '/admin/quota/:user' do |user|
+      halt 403, "access denied\r\n" unless @auth.valid? and @auth.key_info[:admin]
+      quota_mins = params[:quota_mins].to_i
+      home_quota_gb = params[:home_quota_gb].to_i
+      conda_quota_gb = params[:conda_quota_gb].to_i
+      cache_quota_gb = params[:cache_quota_gb].to_i
+      $db_pool.with do |db|
+        r = db.exec_params('select * from quotas where username = $1',
+          [user])
+        halt 404, "no such user\r\n" unless r.ntuples > 0
+
+        quota = r[0].symbolize
+        changes = []
+        changes << "quota_mins = #{quota_mins}" if quota[:quota_mins] != quota_mins
+        changes << "home_quota_gb = #{home_quota_gb}" if quota[:home_quota_gb] != home_quota_gb
+        changes << "conda_quota_gb = #{conda_quota_gb}" if quota[:conda_quota_gb] != conda_quota_gb
+        changes << "cache_quota_gb = #{cache_quota_gb}" if quota[:cache_quota_gb] != cache_quota_gb
+        $log.info("updating quota for #{user}: #{changes.join('; ')}") unless changes.empty?
+
+        r = db.exec_params('update quotas
+          set quota_mins = $2, home_quota_gb = $3, conda_quota_gb = $4,
+          cache_quota_gb = $5 where username = $1',
+          [user, quota_mins, home_quota_gb, conda_quota_gb, cache_quota_gb])
+        halt 404, "no such user\r\n" unless r.cmd_tuples > 0
+      end
+      redirect "/admin/quota/#{user}?saved=1&return_to=#{params[:return_to]}", 303
+    end
+
+    get '/admin/sessions/:zoneid' do |zone_id|
+      halt 403, "access denied\r\n" unless @auth.valid? and @auth.key_info[:admin]
+      @sudo = true
+      $db_pool.with do |db|
+        r = db.exec_params('select * from zones where id = $1', [zone_id])
+        halt 404, "no zone found with id #{zone_id}\r\n" if r.ntuples == 0
+        @zone = r[0].symbolize
+        @zone[:alias] = "comp4703-#{@zone[:id].split('-').first}"
+        @zone[:url] = "https://#{@zone[:alias]}.uqcloud.net"
+        r = db.exec_params('select * from quotas where username = $1',
+          [@zone[:owner]])
+        @quota = r[0].symbolize
+
+        r = db.exec_params('select * from allocations where zone_id = $1
+          and state != \'closed\'', [@zone[:id]])
+        @allocations = []
+        r.each { |a| @allocations << a.symbolize }
+
+        @sessions = {}
+
+        @allocations.each do |alloc|
+          $dbssh_pool.with do |dbssh|
+            r = dbssh.exec_params('select * from sessions where
+              user_id = $1 or host_id = $2 order by created_at asc',
+              [alloc[:ssh_user_id], alloc[:ssh_host_id]])
+            @sessions[alloc[:id]] = []
+            r.each do |row|
+              @sessions[alloc[:id]] << row.symbolize
+            end
+          end
+        end
+
+        r = db.exec_params('select * from allocations where zone_id = $1
+          and state = \'closed\' order by closed desc limit $2',
+          [@zone[:id], 30])
+        @past_allocations = []
+        r.each { |a| @past_allocations << a.symbolize }
+
+        @past_allocations.each do |alloc|
+          next if (Time.now - alloc[:closed]) > 3600*24*3
+          $dbssh_pool.with do |dbssh|
+            r = dbssh.exec_params('select * from old_sessions where
+              allocation_id = $1 order by created_at asc', [alloc[:id]])
+            @sessions[alloc[:id]] = []
+            r.each do |row|
+              @sessions[alloc[:id]] << row.symbolize
+            end
+          end
+        end
+
+        r = db.exec_params('select count(*) as count from allocations
+          where zone_id = $1 and state = \'closed\'', [@zone[:id]])
+        @past_count = r[0]['count']
+
+        r = db.exec_params('select ar.*
+          from allocations as a
+          join alloc_reports ar on ar.allocation_id = a.id
+          where a.zone_id = $1 and ar.time >= $2
+          order by a.id asc, ar.time asc',
+          [@zone[:id], Time.now - 3600*24*3])
+        @alloc_reports = {}
+        r.each do |row|
+          row.symbolize!
+          if @alloc_reports[row[:allocation_id]].nil?
+            @alloc_reports[row[:allocation_id]] = []
+          end
+          @alloc_reports[row[:allocation_id]] << row
+        end
       end
       erb :index
     end
@@ -162,6 +361,54 @@ module Control
 
     get '/puma/stats' do
       Puma.stats
+    end
+
+    get '/nfs/quotas' do
+      halt 403, "access denied\r\n" unless @auth.valid? and @auth.key_info[:type] == :nfs_server
+      $db_pool.with do |db|
+        r = db.exec('select * from quotas')
+        fs = {
+          :home => {},
+          :conda => {},
+          :cache => {}
+        }
+        r.each do |row|
+          row.symbolize!
+          fs[:home][row[:username]] = row[:home_quota_gb]
+          fs[:conda][row[:username]] = row[:conda_quota_gb]
+          fs[:cache][row[:username]] = row[:cache_quota_gb]
+        end
+        JSON.dump(fs)
+      end
+    end
+
+    put '/nfs/usage' do
+      halt 403, "access denied\r\n" unless @auth.valid? and @auth.key_info[:type] == :nfs_server
+      halt 403, "error: x-body-sha256 not signed\r\n" unless @auth.signed_header?('x-body-sha256')
+      bodysha = request.get_header('HTTP_X_BODY_SHA256')
+      halt 403, "error: x-body-sha256 not included\r\n" if bodysha.nil?
+      bodysha = Digest::SHA256.base64digest(bodysha)
+      request.body.rewind
+      data = request.body.read
+      halt 400, "error: expected a JSON body\r\n" if data.nil?
+      oursha = Digest::SHA256.base64digest(Digest::SHA256.base64digest(data))
+      halt 400, "error: body-sha256 did not match body\r\n" if bodysha != oursha
+      obj = JSON.parse(data)
+
+      $db_pool.with do |db|
+        db.exec('begin')
+        db.prepare('update-quota-usage',
+          'update quotas set home_used_mb = $2, conda_used_mb = $3, cache_used_mb = $4
+          where username = $1')
+        obj.each do |username, used|
+          used.symbolize!
+          db.exec_prepared('update-quota-usage', [username,
+            used[:home], used[:conda], used[:cache]])
+        end
+        db.exec('deallocate "update-quota-usage"')
+        db.exec('commit')
+      end
+      "ok: usage updated\r\n"
     end
 
     get '/nfs/exports' do
@@ -226,34 +473,97 @@ module Control
         halt 500, "db error\r\n" if res.cmd_tuples < 1
       end
       rebalance
+      $log.info("worker #{hostname} reporting ready")
       "ok: worker #{hostname} marked ready\r\n"
     end
 
     post '/worker/idle' do
       halt 403, "access denied\r\n" unless @auth.valid? and @auth.key_info[:type] == :worker
       hostname = @auth.key_info[:hostname]
+      alloc = nil
+
+      $log.info("worker #{hostname} reporting idle")
+
       $db_pool.with do |db|
-        r = db.exec_params('update allocations
-          set state = \'allocated\'
-          where worker_hostname = $1
-          and state = \'busy\'', [hostname])
-        halt 200, "ok: no allocations changed\r\n" if r.cmd_tuples < 1
+        r = db.exec_params('select * from allocations
+          where worker_hostname = $1 and state != \'closed\'', [hostname])
+        halt 200, "ok: no allocations changed\r\n" if r.ntuples < 1
+
+        alloc = r[0].symbolize
+
+        if alloc[:state] == 'busy'
+          r = db.exec_params('update allocations
+            set state = \'allocated\' where id = $1 and state = \'busy\'',
+            [alloc[:id]])
+          halt 200, "ok: no allocations changed\r\n" if r.cmd_tuples < 1
+        end
       end
       rebalance
+
+      request.body.rewind
+      data = request.body.read
+      begin
+        obj = JSON.parse(data, :symbolize_names => true)
+        if obj[:reason]
+          $db_pool.with do |db|
+            type = 'idle'
+            reason = obj[:reason]
+            obj.delete(:reason)
+            r = db.exec_params('insert into alloc_reports
+              (allocation_id, time, type, reason, data)
+              values ($1, now(), $2, $3, $4)',
+              [alloc[:id], type, reason, JSON.dump(obj)])
+            halt 500, "error: bad insert\r\n" if r.cmd_tuples < 1
+          end
+        end
+      rescue Exception => ex
+        $log.debug("worker #{hostname} idle report failed body parsing: #{ex.inspect}")
+      end
+
       "ok: worker #{hostname} marked idle\r\n"
     end
 
     post '/worker/busy' do
       halt 403, "access denied\r\n" unless @auth.valid? and @auth.key_info[:type] == :worker
       hostname = @auth.key_info[:hostname]
+      $log.info("worker #{hostname} reporting busy")
+      alloc = nil
       $db_pool.with do |db|
-        r = db.exec_params('update allocations
-          set state = \'busy\'
-          where worker_hostname = $1
-          and state = \'allocated\'', [hostname])
-        halt 200, "ok: no allocations changed\r\n" if r.cmd_tuples < 1
+        r = db.exec_params('select * from allocations
+          where worker_hostname = $1 and state != \'closed\'', [hostname])
+        halt 200, "ok: no allocations changed\r\n" if r.ntuples < 1
+
+        alloc = r[0].symbolize
+
+        if alloc[:state] == 'allocated'
+          r = db.exec_params('update allocations
+            set state = \'busy\' where id = $1 and state = \'allocated\'',
+            [alloc[:id]])
+          halt 200, "ok: no allocations changed\r\n" if r.cmd_tuples < 1
+        end
       end
       rebalance
+
+      request.body.rewind
+      data = request.body.read
+      begin
+        obj = JSON.parse(data, :symbolize_names => true)
+        if obj[:reason]
+          $db_pool.with do |db|
+            type = 'busy'
+            reason = obj[:reason]
+            obj.delete(:reason)
+            r = db.exec_params('insert into alloc_reports
+              (allocation_id, time, type, reason, data)
+              values ($1, now(), $2, $3, $4)',
+              [alloc[:id], type, reason, JSON.dump(obj)])
+            halt 500, "error: bad insert\r\n" if r.cmd_tuples < 1
+          end
+        end
+      rescue Exception => ex
+        $log.debug("worker #{hostname} busy report failed body parsing: #{ex.inspect}")
+      end
+
       "ok: worker #{hostname} marked busy\r\n"
     end
 
@@ -269,6 +579,7 @@ module Control
           [auth_key, token])
       end
       halt 403, "invalid provision token\r\n" if r.ntuples < 1
+      $log.info("worker #{hostname} uploaded auth key, continuing with provisioning")
       "ok: worker auth key saved for #{r[0]['hostname']}\r\n"
     end
 
@@ -360,6 +671,7 @@ module Control
         halt 404, "no user quota found for '#{zone[:owner]}'\r\n" if r.ntuples < 1
         quota = r[0].symbolize
         if quota[:used_mins] > quota[:quota_mins]
+          $log.info("user #{zone[:owner]} (#{zone[:id]}) denied due to quota")
           halt 429, "user '#{zone[:owner]}' is over time quota (used #{quota[:used_mins]} minutes out of #{quota[:quota_mins]})\r\n"
         end
 
@@ -374,6 +686,7 @@ module Control
           db.exec('commit')
           do_wait = true if r[0]['state'] == 'waiting'
         else
+          $log.info("starting new allocation for #{zone[:owner]} (#{zone[:id]}")
           r = db.exec_params('insert into allocations
             (zone_id) values ($1) returning id',
             [zone[:id]])

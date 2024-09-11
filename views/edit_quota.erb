@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>COMP4703 admin</title>
+    <link rel="stylesheet" href="/static/bootstrap.min.css" />
+  </head>
+  <body class="bg-light">
+    <div class="container-sm">
+      <h1>COMP4703 quota admin</h1>
+      <% if params[:saved] %>
+      <div class="alert alert-success" role="alert">
+        Quota updated for <%= @quota[:username] %>
+      </div>
+      <% end %>
+      <form method="post" action="/admin/quota/<%= @quota[:username] %>?return_to=<%= params[:return_to] %>">
+        <div class="mb-3">
+          <label for="username" class="form-label">Username</label>
+          <input type="text" class="form-control" disabled id="username" placeholder="<%= @quota[:username] %>"/>
+        </div>
+        <div class="mb-3">
+          <label for="quota_mins" class="form-label">Time quota</label>
+          <div class="input-group">
+            <input class="form-control" type="number" id="quota_mins" name="quota_mins" value="<%= @quota[:quota_mins] %>">
+            <div class="input-group-text">minutes</div>
+          </div>
+        </div>
+        <div class="mb-3 hstack gap-3">
+            <button class="btn btn-outline-info" type="button" onclick="bumpQuota(60)">+1 hr</button>
+            <button class="btn btn-outline-info" type="button" onclick="bumpQuota(600)">+10 hr</button>
+          </div>
+        <div class="mb-3">
+          <label for="home_quota_gb" class="form-label">Disk quota</label>
+          <div class="vstack gap-1">
+            <div class="input-group">
+              <div class="input-group-text" style="width: 30%"><code>home</code></div>
+              <input class="form-control" type="number" id="home_quota_gb" name="home_quota_gb" value="<%= @quota[:home_quota_gb] %>">
+              <div class="input-group-text">GB</div>
+            </div>
+            <div class="input-group">
+              <div class="input-group-text" style="width: 30%"><code>conda</code></div>
+              <input class="form-control" type="number" id="conda_quota_gb" name="conda_quota_gb" value="<%= @quota[:conda_quota_gb] %>">
+              <div class="input-group-text">GB</div>
+            </div>
+            <div class="input-group">
+              <div class="input-group-text" style="width: 30%"><code>cache</code></div>
+              <input class="form-control" type="number" id="cache_quota_gb" name="cache_quota_gb" value="<%= @quota[:cache_quota_gb] %>">
+              <div class="input-group-text">GB</div>
+            </div>
+          </div>
+          <div class="mb-3" style="margin-top: 1em;">
+            <div class="gap-3 hstack">
+              <button class="btn btn-primary" type="submit">Save</button>
+              <a href="<%= params[:return_to] %>" class="btn btn-secondary">Back</a>
+            </div>
+          </div>
+        </div>
+      </form>
+    </div>
+    <script src="/static/bootstrap.bundle.min.js"></script>
+    <script>
+      function bumpQuota(n) {
+        var e = document.getElementById('quota_mins');
+        e.value = (parseInt(e.value) + n).toString();
+        return false;
+      }
+    </script>
+  </body>
+</html>
