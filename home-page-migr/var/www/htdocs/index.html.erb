@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="refresh" content="300" />
+    <title>COMP4703 zone</title>
+    <link rel="stylesheet" href="/static/bootstrap.min.css" />
+  </head>
+  <body class="bg-light-subtle">
+    <div class="container">
+      <div class="card float-end mt-3">
+        <div class="card-header">
+          Quick links
+        </div>
+        <div class="card-body">
+          <a class="btn btn-small btn-primary" href="https://comp4703-control.uqcloud.net">My quota</a>
+          <a class="btn btn-small btn-primary" href="/ttyd">Web terminal (<code>ttyd</code>)</a>
+          <a class="btn btn-small btn-primary" href="/jupyter">Jupyter notebook</a>
+          <a class="btn btn-small btn-primary" href="/filebrowser">File browser</a>
+          </ul>
+        </div>
+      </div>
+      <h1 class="display-1">Welcome</h1>
+      <p>For this course, you will be able to use a temporary GPU instance.</p>
+      <p>The amount of time you can run your GPU instance for is limited. You can check <a href="https://comp4703-control.uqcloud.net/">your current time quota on the control panel</a> to find out how much time you have available. Your quota will re-fill automatically over time (at a rate of a few minutes per hour).</p>
+
+      <h3>How to log in</h3>
+      <a id="how-to-log-in"/>
+      <p>You can choose from the following methods to log into your GPU instance:</p>
+      <ul>
+        <li><a href="/jupyter">JupyterLab</a></li>
+        <li><a href="/ttyd">Web terminal</a></li>
+        <li><b>SSH</b>: connect to your zone with <code>ssh <%= owner %>@comp4703-<%= zalias %>.zones.eait.uq.edu.au</code> and then run <code>ssh gpu</code> to log into your GPU instance.</li>
+      </ul>
+      <p>Once your session has started, your GPU node is assigned to you and your time quota will continue to be charged for the time it is running, until one of the conditions under <a href="#ending-your-session">Ending your session</a> (below) becomes true.</p>
+
+      <h3>Directories and storing data</h3>
+      <a id="directories-and-storage"/>
+      <p>Inside the GPU instance, the following directories will persist (be stored permanently and available every time you log in):</p>
+      <ul>
+        <li><code>/home/comp4703</code>: keep your code, notebooks and data here</li>
+        <li><code>/conda</code>: a pre-installed Conda environment with most of the packages you should need. You can install additional packages using <code>conda</code> or <code>pip</code> commands</li>
+        <li><code>/zone/home/<%= owner %></code>: this directory is shared with your zone, can be used to transfer files in and out of your other storage</li>
+      </ul>
+      <p>You may also use the temporary directory <code>/scratch</code> for intermediate results and data that does not need to survive between sessions. Access to this directory may be faster than the persistent directories, so if you have performance issues it can be worth considering copying input data into <code>/scratch</code> as well.</p>
+      <p>To upload or download files, you can either use JupyterLab or access <a href="/filebrowser">the local file browser</a> on your zone (files in the zone's local file browser are mounted at <code>/zone/home/<%= owner %></code> on your GPU node).</p>
+
+      <h3>Ending your session</h3>
+      <a id="ending-your-session"/>
+      <p>Sessions with your GPU instance <b>can continue to run after you have disconnected</b> (from either your SSH/web terminal session or JupyterLab).</p>
+      <p>In general, a session will continue to run for as long as you have sufficient time quota, the session has processes running in it, and those processes are using CPU or GPU resources.</p>
+      <p>When you want <b>to end your session</b>, the best way to do so is to <b>make sure that all processes you started on the GPU instance have been terminated</b>, and all your interactive connections (SSH, web terminal, Jupyter) are closed.</p>
+      <p>If you leave a session <i>idle</i> (not using any GPU/CPU resources), it will eventually be automatically terminated. This automatic termination will take longer if you leave an interactive connection open.</p>
+      <p>The full set of rules for when the system terminates a session are laid out in the following section.</p>
+
+      <h4>Session termination rules</h4>
+      <p style="font-style: italic;">In these rules, "SSH connection" includes any interactive session (such as a web terminal open in a browser tab, or JupyterLab running).</p>
+      <p>Your session on the GPU instance will be automatically terminated if:</p>
+      <ul>
+        <li>You run out of quota</li>
+        <li>No processes are running at all and 5 minutes have elapsed since the last SSH connection closed</li>
+        <li>Processes are running, but they are <i>idle</i>, no SSH connections are open, and 15 minutes have elapsed since the last SSH connection closed</li>
+        <li>Processes are running and an SSH connection is open, but they are <i>idle</i>, and 30 minutes have elapsed since the start of the most recent SSH connection</li>
+      </ul>
+      <div class="alert alert-primary border-0 border-start border-5 border-primary">
+        <b>Idle quota charges</b>: for the 5-minute and 15-minute disconnected idle session termination rules, your quota will not be charged for the final 5/15 minutes. These are effectively "grace" periods for you to reconnect to the session in if you are unintentionally disconnected.
+      </div>
+      <p>A session with running processes is considered <i>idle</i> unless <b>one</b> of the following is true:</p>
+      <ul>
+        <li>GPU power consumption >20% of TDP</li>
+        <li>GPU memory allocated >30% of max</li>
+        <li>Average CPU usage >2%</li>
+        <li>Total CPU time consumed >10 core-seconds in the last 5 minutes</li>
+      </ul>
+      <p>Additionally, the following "hold" rules apply: if any of the following are true, the session is temporarily <b>not</b> considered <i>idle</i> where it normally would be:</p>
+      <ul>
+        <li>CPU/GPU usage (as defined above) was detected in the last 15 minutes</li>
+        <li>An <code>ipykernel</code> process is running and CPU/GPU usage was detected in the last hour</li>
+        <li>A <code>python</code> process other than the Jupyter UI is running and CPU/GPU usage was detected in the last hour</li>
+        <li>Any other process (not a shell, <code>tmux</code>, Jupyter component, Python interpreter, <code>script</code> utility etc) is running and has caused CPU or GPU usage in the last hour</li>
+      </ul>
+      <p>If you want to look at which of these rules were applied to a recent session of yours, you can use the <a href="https://comp4703-control.uqcloud.net/admin/sessions/<%= zuuid %>">advanced session information page</a> of the control panel.</p>
+
+      <h3>Tips</h3>
+      <a id="tips"/>
+      <p>If you are using JupyterLab, we strongly recommend that you shut down all kernels when you are done, to avoid losing an entire hour of quota to the <code>ipykernel</code> hold rule.</p>
+      <p>When running a long task, we also strongly recommend you save output to a file using e.g. the <code>script</code> command, so that when you come back later and your session has been terminated, you can review the output on disk. Setting <code>script</code> to write directly into <code>/zone/home/<%= owner %></code> will allow you to view it locally on your zone without creating a new GPU session.</p>
+    </div>
+    <script src="/static/bootstrap.bundle.min.js"></script>
+  </body>
+</html>
