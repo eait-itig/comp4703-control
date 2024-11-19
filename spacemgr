@@ -1,0 +1,107 @@
+#!/usr/bin/ruby
+require 'json'
+require 'tempfile'
+require 'logger'
+require 'open3'
+require 'digest'
+
+LOCK_FILE = '/run/spacemgr.lock'
+LOG_FILE = '/var/log/spacemgr.log'
+
+ENV['PATH'] = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+ENV['SSH_AUTH_SOCK'] = '/var/lib/auth-keys/sockets/default'
+ENV['SDC_KEY_ID'] = %x{ssh-add -l}.split[1]
+ENV['SDC_ACCOUNT'] = %x{hostname}.strip
+
+def sh(cmd, input: nil, check: true)
+  $log.info("CMD: #{cmd}")
+  $logfile.flush
+  outlines = []
+  Open3.popen3(cmd) do |stdin, stdout, stderr, waiter|
+    stdin.write(input) if not input.nil?
+    stdin.close
+    fds = [stdout, stderr]
+    loop do
+      rs, _, _ = IO.select(fds)
+      rs.each do |fd|
+        if fd.eof?
+          fds.delete(fd)
+          next
+        end
+        line = fd.readline.chomp
+        if fd == stdout and line != ''
+          outlines << line
+          $log.info('> ' + line)
+        elsif fd == stderr
+          $log.error('> ' + line)
+        end
+      end
+      break if fds.empty?
+    end
+    exit_status = waiter.value
+    if exit_status != 0 and check
+      raise Exception.new("Command '#{cmd}' exited with status #{exit_status}")
+    end
+  end
+  outlines
+end
+
+$lock = File.open(LOCK_FILE, File::CREAT)
+$lock.flock(File::LOCK_EX)
+
+#$logfile = File.open(LOG_FILE, File::WRONLY | File::APPEND | File::CREAT | File::SYNC)
+$logfile = STDERR
+$log = Logger.new($logfile)
+$log.level = Logger::DEBUG
+
+digest = nil
+
+loop do
+  uri = 'https://comp4703-control.uqcloud.net/nfs/quotas'
+  obj = nil
+  $log.info('fetching latest quotas')
+  begin
+    data = sh("sdc-curl -s #{uri}")
+    obj = JSON.parse(data.join("\n"), :symbolize_names => true)
+  rescue Exception
+    sleep 1
+    next
+  end
+  next unless obj[:home]
+
+  report = {}
+  _, used, avail = sh("zfs list -Hpo name,used,avail storage").first.split
+  report[:pool] = {used: used.to_i, available: avail.to_i}
+
+  obj.each do |top, users|
+    zfs = {}
+    sh("zfs list -Hpo name,origin,used,quota -d 1 -r storage/#{top}").each do |line|
+      name, origin, used, quota = line.split("\t")
+      zfs[name] = {:origin => origin, :used => used.to_i, :quota => quota.to_i}
+    end
+    originsnap = sh("zfs get -Hpo value comp4703:new-origin storage/#{top}").first
+    origin = "storage/#{top}/#{originsnap}"
+    users.each do |user, quota_gb|
+      uzfs = zfs["storage/#{top}/#{user}"]
+      if uzfs.nil?
+        sh("zfs clone #{origin} storage/#{top}/#{user}")
+        uzfs = {:origin => origin, :used => 0}
+      end
+      if uzfs[:origin] != origin
+        $log.debug("origin mismatch! storage/#{top}/#{user} is a clone of #{uzfs[:origin]} but new origin is #{origin}")
+      end
+      if uzfs[:quota] != quota_gb * 1024 * 1024 * 1024
+        sh("zfs set quota=#{quota_gb}gb storage/#{top}/#{user}")
+      end
+      report[user] ||= {}
+      report[user][top] = (uzfs[:used] / 1024.0 / 1024.0).round
+    end
+  end
+
+  data = JSON.dump(report)
+  hash = Digest::SHA256.base64digest(data)
+  sh("sdc-curl -s --sign-headers='x-body-sha256: #{hash}' -T - https://comp4703-control.uqcloud.net/nfs/usage",
+    input: JSON.dump(report))
+
+  sleep 300
+end

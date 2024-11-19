@@ -15,3 +15,5 @@ gem "sinatra-contrib", "~> 3.2"
 gem "duration", "~> 0.1.0"
 gem "aws-sdk-budgets", "~> 1.71"
 gem "aws-sdk-account", "~> 1.28"
+
+gem "tzinfo", "~> 2.0"

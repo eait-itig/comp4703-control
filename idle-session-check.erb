@@ -4,6 +4,7 @@ require 'logger'
 require 'socket'
 require 'date'
 require 'json'
+require 'etc'
 
 LOCK_FILE = '/run/idle-session-check.lock'
 LOG_FILE = '/var/log/idle-session-check.log'
@@ -63,6 +64,7 @@ if out =~ /no valid assignment/
   $log.info 'no valid assigment for this node, killing all procs'
   sh('pkill -u comp4703', check: false)
   sh('pkill -U comp4703', check: false)
+  sh('rm -f /etc/zoneid')
   exit 0
 end
 obj = nil
@@ -73,21 +75,112 @@ rescue Exception => ex
   exit 1
 end
 
+zid = obj[:zone_id]
+allocated_at = DateTime.parse(obj[:allocated])
 last_nonidle = File.exist?(NONIDLE_STAMP) ? File.mtime(NONIDLE_STAMP).to_datetime : nil
 last_connect = obj[:last_connect] ? DateTime.parse(obj[:last_connect]) : nil
-cdelta = last_connect ? DateTime.now - last_connect : Rational(7,1)
+adelta = DateTime.now - allocated_at
+cdelta = last_connect ? (DateTime.now - last_connect) : Rational(7,1)
 idelta = last_nonidle ? (DateTime.now - last_nonidle) : Rational(7,1)
+
+TicksPerSec = %x{getconf CLK_TCK}.to_i
+CompUid = Etc.getpwnam('comp4703').uid
+def read_comp(io)
+  c = io.read(2).unpack('S').first
+  (c & 0x1fff) << (((c >> 13) & 0x7) * 3)
+end
+def read_comp_time(io)
+  read_comp(io).to_f / TicksPerSec.to_f
+end
+
+class BadVersionException < Exception
+  attr_reader :version
+  def initialize(version)
+    @version = version
+  end
+end
+
+$log.info 'checking and resetting pacct'
+sams = []
+acctf = "/var/log/account/pacct.#{zid}"
+begin
+  f = File.new(acctf)
+  sastart = f.birthtime
+  sawindow_sec = Time.now - sastart
+  $log.info "process accounting window covers #{sawindow_sec} seconds"
+  until f.eof?
+    row = {}
+    flags, row[:version] = f.read(2).unpack('CC')
+    row[:flags] = []
+    row[:flags] << :fork if flags & 0x01 != 0
+    row[:flags] << :superuser if flags & 0x02 != 0
+    row[:flags] << :coredump if flags & 0x08 != 0
+    row[:flags] << :signal if flags & 0x10 != 0
+    raise BadVersionException.new(version) if row[:version] != 3
+    row[:tty], row[:exitcode], row[:uid], row[:gid], row[:pid], row[:ppid], row[:btime] = f.read(26).unpack('SLLLLLL')
+    row[:etime] = f.read(4).unpack('f').first
+    row[:utime] = read_comp_time(f)
+    row[:stime] = read_comp_time(f)
+    row[:kmem] = read_comp(f)
+    _ = f.read(4)                   # io / rwblocks unused, ignore
+    row[:minflt] = read_comp(f)
+    row[:majflt] = read_comp(f)
+    _ = f.read(2)
+    row[:comm] = f.read(16).strip
+    sams << row
+  end
+  f.close
+rescue BadVersionException => ex
+  $log.error "process accounting data is wrong version? v = #{ex.version}"
+rescue Exception => ex
+  $log.info 'no process acounting info yet?'
+  $log.info ex.inspect
+end
+$log.debug "read in #{sams.size} pacct rows"
+sh("rm -f #{acctf}")
+sh("touch #{acctf}")
+sh("accton #{acctf}")
+
+sams.each do |sam|
+  next unless sam[:uid] == CompUid
+
+  data = {}
+  data[:execname] = sam[:comm]
+  data[:pid] = sam[:pid]
+  data[:avg_mem_mb] = (sam[:kmem] / 1024.0).round(1)
+  avg_cpu = (sam[:utime] + sam[:stime]) / sam[:etime].clamp(1, 1e12)
+  time_in_window = 1.0
+  if sam[:btime] < sastart.to_i
+    time_in_window = (sastart.to_f - sam[:btime]) / sam[:etime]
+  end
+  cpu_sec = ((sam[:utime] + sam[:stime]) * time_in_window).round(2)
+  data[:percent_cpu] = (100 * avg_cpu).round
+
+  if cpu_sec > 0.01*sawindow_sec
+    $log.info "not idle: pacct for #{data[:pid]} shows usage: cpu_sec = #{cpu_sec} > 1% of window (#{(0.01*sawindow_sec.round(2))})"
+    data[:reason] = 'busy-cpu'
+    json = JSON.dump(data)
+    sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/busy")
+    sh("touch #{NONIDLE_STAMP}")
+    exit 0
+  end
+end
 
 pgreps = nil
 begin
   pgreps = sh('pgrep -af -u comp4703')
 rescue Exception
-  $log.info 'no processes running, marking as idle'
-  json = JSON.dump({
-    reason: 'no-processes'
-  })
-  sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/idle")
-  exit 0
+  if idelta > Rational(5, 24*60) and adelta > Rational(5, 24*60)
+    $log.info 'no processes running, marking as idle'
+    json = JSON.dump({
+      reason: 'no-processes'
+    })
+    sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/idle")
+    exit 0
+  else
+    $log.info 'no processes running, but busy in last 5m, not reporting'
+    exit 0
+  end
 end
 
 state = :pwr
@@ -101,7 +194,7 @@ sh('nvidia-smi').each do |line|
       mem_frac = $1.to_f / $2.to_f
       gpu_info[:percent_gpu_mem] = (mem_frac * 100).round
     end
-    $log.info "GPU is using #{gpu_info[:gpu_pwr_percent]}% power, #{gpu_info[:gpu_mem_percent]} memory"
+    $log.info "GPU is using #{gpu_info[:percent_gpu_pwr]}% power, #{gpu_info[:percent_gpu_mem]} memory"
     state = :proc
   elsif state == :proc
     next unless line =~ /^[\s|]+Processes:[\s|]+$/
@@ -132,24 +225,64 @@ if gpu_info[:percent_gpu_pwr] > 20 or gpu_info[:percent_gpu_mem] > 30
 end
 
 got_headings = 0
-sh('top -bn2 -d10 -U comp4703').each do |line|
-  fields = line.split.map { |f| f.strip }
-  if got_headings < 2
-    next unless fields[0] == 'PID' and fields[8] == '%CPU'
-    got_headings += 1
-    next
+
+prev_idles = {}
+idle_window_sec = 5*60
+begin
+  File.open("/run/idle-procs.#{zid}") do |f|
+    idle_window_sec = Time.now - f.mtime
+    until f.eof?
+      obj = JSON.parse(f.readline, symbolize_names: true)
+      obj[:stime] = DateTime.parse(obj[:stime]).to_time
+      prev_idles[[obj[:pid], obj[:stime].to_i/2]] = obj
+    end
   end
-  if fields[8].to_f > 2.0
-    $log.info "not idle: pid #{fields[0]} (#{fields.last}) is using >2% cpu"
+rescue Exception
+end
+procs = []
+
+now = Time.now
+sh('ps -ww --noheaders -eo pid,uid,etimes,cputimes,rss,comm').each do |line|
+  next unless line =~ /^\s*([0-9]+)\s+([0-9]+)\s+([0-9]+)\s+([0-9]+)\s+([0-9]+)\s+(.+)$/
+
+  obj = {}
+
+  obj[:pid] = $1.to_i
+  uid = $2.to_i
+  etime = $3.to_i
+  obj[:cpu_sec] = cpu_sec = $4.to_i
+  rss_mb = ($5.to_f / 1024).round(2)
+  execname = $6.slice(0, 40)
+
+  obj[:stime] = now - etime
+
+  next unless uid == CompUid
+  procs << obj
+
+  k = [obj[:pid], obj[:stime].to_i/2]
+  if prev_idles[k]
+    cpu_sec = obj[:cpu_sec] - prev_idles[k][:cpu_sec]
+  end
+
+  percent_cpu = (100.0 * cpu_sec.to_f / idle_window_sec.to_f).round
+
+  if percent_cpu > 2 or cpu_sec > 10
+    $log.info "not idle: pid #{obj[:pid]} (#{execname}) is using >2% cpu"
     json = JSON.dump({
-      reason: 'busy-process',
-      pid: fields[0].to_i,
-      execname: fields.last,
-      percent_cpu: fields[8].to_f
+      reason: 'busy-cpu',
+      pid: obj[:pid],
+      execname: execname,
+      percent_cpu: percent_cpu,
+      rss_mb: rss_mb
     })
     sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/busy")
     sh("touch #{NONIDLE_STAMP}")
     exit 0
+  end
+end
+File.open("/run/idle-procs.#{zid}", 'w') do |f|
+  procs.each do |v|
+    f.puts JSON.dump(v)
   end
 end
 
@@ -158,36 +291,72 @@ pgreps.each do |line|
   next unless line =~ /^([0-9]+)[ ]+(.*)$/
   pid = $1.to_i
   cmdline = $2
-  next if cmdline =~ /^-bash/
+  next if cmdline =~ /^-bash/ or cmdline =~ /\/bin\/bash$/ or cmdline =~ /bash -i$/ or cmdline =~ /bash --login$/
   next if cmdline =~ /^sshd:/
-  next if cmdline =~ /^tmux/
-  if (cmdline =~ /ipykernel/ or cmdline =~ /python/) and idelta < Rational(1, 24)
+  next if cmdline =~ /^tmux( |$)/
+  next if cmdline =~ /^sleep( |$)/
+  next if cmdline =~ /^script( |$)/
+  if cmdline =~ /ipykernel/ and idelta < Rational(1, 24)
     $log.info "not idle: ipykernel running in pid #{pid}, cpu/gpu usage in last 1h"
     json = JSON.dump({
-      reason: 'python-usage-1h',
+      reason: 'ipykern-hold-1h',
       pid: pid,
-      execname: cmdline
+      execname: cmdline.slice(0, 40)
     })
     sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/busy")
     exit 0
   end
   next if cmdline =~ /jupyter/ or cmdline =~ /jupyter-lab/
-  next if cmdline =~ /ipykernel/ or cmdline =~ /python/
-  if idelta < Rational(2, 24)
-    $log.info "not idle: cpu/gpu usage in last 2h and '#{cmdline}' is running"
+  if cmdline =~ /python/ and idelta < Rational(1, 24)
+    $log.info "not idle: python running in pid #{pid}, cpu/gpu usage in last 1h"
     json = JSON.dump({
-      reason: 'other-proc-usage-2h',
+      reason: 'python-hold-1h',
       pid: pid,
-      execname: cmdline
+      execname: cmdline.slice(0, 40)
+    })
+    sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/busy")
+    exit 0
+  end
+  next if cmdline =~ /ipykernel/ or cmdline =~ /python/
+  if idelta < Rational(1, 24)
+    $log.info "not idle: cpu/gpu usage in last 1h and '#{cmdline}' is running"
+    json = JSON.dump({
+      reason: 'process-hold-1h',
+      pid: pid,
+      execname: cmdline.slice(0, 40)
     })
     sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/busy")
     exit 0
   end
 end
 
+if idelta < Rational(15, 24*60)
+  $log.info "not idle: cpu/gpu usage in last 15m"
+  json = JSON.dump({
+    reason: 'cpugpu-hold-15m',
+    nprocs: pgreps.size
+  })
+  sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/busy")
+  exit 0
+end
+
+if adelta < Rational(5, 24*60)
+  $log.info 'session only just started, not reporting idle for now'
+  exit 0
+end
+
+if adelta > Rational(15, 24*60)
+  delta = [adelta, idelta].min
+  $log.info 'announcing status to user'
+  sh('write comp4703',
+    input: "This session has been idle for #{(delta*24*60).round} minutes, and will soon be terminated.")
+end
+
 $log.info "marking idle in controller"
 json = JSON.dump({
-  reason: 'timed-out'
+  reason: 'all-procs-idle',
+  nprocs: pgreps.size,
+  min_since_cpugpu: (idelta * 24 * 60).round
 })
 sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/idle")
 
@@ -200,5 +369,6 @@ sh("sdc-curl -s -XPOST -d '#{json}' http://<%= @myaddr %>:443/worker/idle")
     $log.info 'no valid assigment for this node, killing all procs'
     sh('pkill -u comp4703', check: false)
     sh('pkill -U comp4703', check: false)
+    exit 0
   end
 end

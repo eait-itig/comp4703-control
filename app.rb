@@ -30,24 +30,24 @@ def rebalance
   end
 end
 
+class TimeoutError < RuntimeError
+end
+
 def await_any_allocation
   t0 = Time.now
   sock = nil
   begin
     sock = UNIXSocket.new($sockpath)
     sock.puts JSON.dump({:operation => :wait_any})
-    r = IO.select([sock], [], [], 60)
-    raise 'timeout' if r.nil?
+    r = IO.select([sock], [], [], 10)
+    raise TimeoutError.new if r.nil?
     line = sock.gets
     if line.nil?
       raise 'failed to contact balancer process'
     end
     res = JSON.parse(line, :symbolize_names => true)
     raise res[:reason] if res[:status] != 'ok'
-  rescue Exception => err
-    raise err if Time.now - t0 > 60
-    sleep 1
-    retry
+  rescue TimeoutError
   ensure
     sock.close unless sock.nil?
   end
@@ -183,9 +183,14 @@ module Control
         @config = []
         r.each { |c| @config << c.symbolize }
 
-        r = db.exec('select * from budgets where name = $1',
-          ["comp4703-#{Time.now.year}"])
-        @budget = r[0].symbolize
+        r = db.exec('select * from budgets')
+        @budgets = []
+        r.each { |b| @budgets << b.symbolize }
+        @budget = @budgets.find { |b| b[:name] == "comp4703-#{Time.now.year}" }
+
+        r = db.exec('select * from nfs_servers')
+        @nfs_servers = []
+        r.each { |c| @nfs_servers << c.symbolize }
 
         r = db.exec('select sum(used_mins) as used, sum(quota_mins) as quota from quotas')
         @budget[:total_used_mins] = r[0]['used']
@@ -218,7 +223,7 @@ module Control
 
         r = db.exec_params('select * from allocations
           where (state != \'closed\' or closed >= $1)
-          order by created desc', [Time.now - 3600*3])
+          order by created desc', [Time.now - 3600*12])
         @allocations = []
         r.each { |w| @allocations << w.symbolize }
 
@@ -275,12 +280,16 @@ module Control
     end
 
     get '/admin/sessions/:zoneid' do |zone_id|
-      halt 403, "access denied\r\n" unless @auth.valid? and @auth.key_info[:admin]
-      @sudo = true
       $db_pool.with do |db|
         r = db.exec_params('select * from zones where id = $1', [zone_id])
         halt 404, "no zone found with id #{zone_id}\r\n" if r.ntuples == 0
         @zone = r[0].symbolize
+      end
+      halt 403, "access denied\r\n" unless @auth.valid? and (
+        @auth.key_info[:admin] or
+        @auth.key_info[:user] == @zone[:owner])
+      @sudo = true
+      $db_pool.with do |db|
         @zone[:alias] = "comp4703-#{@zone[:id].split('-').first}"
         @zone[:url] = "https://#{@zone[:alias]}.uqcloud.net"
         r = db.exec_params('select * from quotas where username = $1',
@@ -328,19 +337,33 @@ module Control
           where zone_id = $1 and state = \'closed\'', [@zone[:id]])
         @past_count = r[0]['count']
 
+        tlimit = Time.now - 3600*24*3
+        tlimit = Time.now - 3600*24*3650*3 if params[:all]
         r = db.exec_params('select ar.*
           from allocations as a
           join alloc_reports ar on ar.allocation_id = a.id
           where a.zone_id = $1 and ar.time >= $2
           order by a.id asc, ar.time asc',
-          [@zone[:id], Time.now - 3600*24*3])
-        @alloc_reports = {}
+          [@zone[:id], tlimit])
+        @alloc_reports = Hash.new([])
+        held_reports = {}
         r.each do |row|
           row.symbolize!
-          if @alloc_reports[row[:allocation_id]].nil?
-            @alloc_reports[row[:allocation_id]] = []
+          aid = row[:allocation_id]
+          l = @alloc_reports[aid].last
+          if l and l[:state] == row[:state] and l[:reason] == row[:reason] and
+                l[:data].approx_equal?(row[:data], epsilon: 0.5)
+            held_reports[aid] = row
+            next
           end
-          @alloc_reports[row[:allocation_id]] << row
+          if held_reports[aid]
+            @alloc_reports[aid] += [held_reports[aid]]
+            held_reports.delete(aid)
+          end
+          @alloc_reports[aid] += [row]
+        end
+        held_reports.each do |aid, report|
+          @alloc_reports[aid] += [report]
         end
       end
       erb :index
@@ -397,6 +420,17 @@ module Control
 
       $db_pool.with do |db|
         db.exec('begin')
+
+        pool_usage = (obj['pool'] || {}).symbolize
+        obj.delete('pool')
+        if pool_usage[:used]
+          db.exec_params('update nfs_servers set used_mb = $2, total_mb = $3
+            where hostname = $1',
+            [@auth.key_info[:hostname],
+             (pool_usage[:used] / 1024.0 / 1024.0).round,
+             ((pool_usage[:used] + pool_usage[:available]) / 1024.0 / 1024.0).round])
+        end
+
         db.prepare('update-quota-usage',
           'update quotas set home_used_mb = $2, conda_used_mb = $3, cache_used_mb = $4
           where username = $1')
@@ -452,7 +486,10 @@ module Control
         end
         shash = Digest::SHA256.hexdigest(JSON.dump(mounts))
         if shash == digest and (Time.now - t0) < 300
-          await_any_allocation
+          begin
+            await_any_allocation
+          rescue Exception
+          end
           next
         end
         return JSON.dump({
@@ -542,7 +579,6 @@ module Control
           halt 200, "ok: no allocations changed\r\n" if r.cmd_tuples < 1
         end
       end
-      rebalance
 
       request.body.rewind
       data = request.body.read
@@ -578,9 +614,10 @@ module Control
           returning hostname',
           [auth_key, token])
       end
+      hostname = r[0]['hostname']
       halt 403, "invalid provision token\r\n" if r.ntuples < 1
       $log.info("worker #{hostname} uploaded auth key, continuing with provisioning")
-      "ok: worker auth key saved for #{r[0]['hostname']}\r\n"
+      "ok: worker auth key saved for #{hostname}\r\n"
     end
 
     get '/worker/assignment' do
@@ -607,6 +644,7 @@ module Control
         zone[:id], $mungekey))
       JSON.dump({
         state: alloc[:state],
+        allocated: alloc[:allocated],
         last_connect: alloc[:last_connect],
         zone_id: zone[:id],
         zone_ip: zone[:vpn_addr],
@@ -672,7 +710,9 @@ module Control
         quota = r[0].symbolize
         if quota[:used_mins] > quota[:quota_mins]
           $log.info("user #{zone[:owner]} (#{zone[:id]}) denied due to quota")
-          halt 429, "user '#{zone[:owner]}' is over time quota (used #{quota[:used_mins]} minutes out of #{quota[:quota_mins]})\r\n"
+          used = Duration.new(minutes: quota[:used_mins])
+          limit = Duration.new(minutes: quota[:quota_mins])
+          halt 429, "user '#{zone[:owner]}' is over time quota (used #{used} out of #{limit})\r\n"
         end
 
         db.exec('begin')
@@ -706,11 +746,11 @@ module Control
             set state = $2, last_connect = now()
             where id = $1',
             [alloc_id, 'busy'])
-          $dbssh_pool.with do |dbssh|
-            dbssh.exec_params('update users
-              set comment = NULL
-              where id = $1', [r[0]['ssh_user_id']])
-          end
+          # $dbssh_pool.with do |dbssh|
+          #   dbssh.exec_params('update users
+          #     set comment = NULL
+          #     where id = $1', [r[0]['ssh_user_id']])
+          # end
         end
       end
 

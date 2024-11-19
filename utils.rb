@@ -1,4 +1,30 @@
 require 'duration'
+require 'tzinfo'
+require 'date'
+
+$local_tz = TZInfo::Timezone.get('Australia/Brisbane')
+
+class Time
+  def in_timezone(zone)
+    zone = TZInfo::Timezone.get(zone) if zone.is_a?(String)
+    zone.to_local(self)
+  end
+
+  def to_local
+    in_timezone($local_tz)
+  end
+end
+
+class DateTime
+  def in_timezone(zone)
+    zone = TZInfo::Timezone.get(zone) if zone.is_a?(String)
+    zone.to_local(self.to_time).to_datetime
+  end
+
+  def to_local
+    in_timezone($local_tz)
+  end
+end
 
 OrigDuration = Duration
 Object.send(:remove_const, :Duration)
@@ -62,5 +88,20 @@ class Hash
   end
   def symbolize!
     self.transform_keys!(&:to_sym)
+  end
+  def approx_equal?(other, epsilon: 0.1)
+    return false unless other.is_a?(Hash)
+    self.keys.each do |k|
+      if self[k].is_a?(Numeric) and k.to_s != 'pid'
+        return false if other[k].nil?
+        return false unless other[k].is_a?(Numeric)
+        delta = (self[k] - other[k]).abs
+        maxdelta = epsilon * [self[k], other[k]].max
+        return false if delta > maxdelta
+      else
+        return false if self[k] != other[k]
+      end
+    end
+    return true
   end
 end

@@ -39,7 +39,8 @@
             <th style="width: 10em" class="d-none d-lg-table-cell">IP address</th>
             <th style="width: 8em">State</th>
             <th>Allocated to</th>
-            <th>Changed</th>
+            <th class="d-none d-lg-table-cell">Created</th>
+            <th>Last changed state</th>
           </tr>
         </thead>
         <tbody>
@@ -48,6 +49,7 @@
           <% classes << 'table-success' if w[:state] == 'ready' %>
           <% classes << 'table-warning' if w[:state] == 'provisioning' %>
           <% classes << 'table-danger' if w[:state] == 'provisioning' and (Time.now - w[:state_change]) > 3600 %>
+          <% classes << 'table-danger' if w[:state] == 'destroying' %>
           <tr class="<%= classes.join(' ') %>">
             <td><code style="font-weight: bold; color: black;"><%= w[:hostname] %></code></td>
             <td class="d-none d-lg-table-cell"><code><%= w[:vpn_addr] %></code></td>
@@ -57,7 +59,7 @@
               <% classes << 'bg-success' if w[:state] == 'ready' %>
               <% classes << 'bg-primary' if w[:state] == 'assigned' %>
               <% classes << 'bg-secondary' if w[:state] == 'busy' %>
-              <% classes << 'bg-error' if w[:state] == 'destroying' %>
+              <% classes << 'bg-danger' if w[:state] == 'destroying' %>
               <span class="<%= classes.join(' ') %>"><%= w[:state] %></span>
             </td>
             <td>
@@ -70,8 +72,12 @@
               <span style="font-style: italic; opacity: 0.6;">(none)</span>
               <% end %>
             </td>
+            <td class="d-none d-lg-table-cell">
+              <code class="text-dark"><%= w[:created].to_local.strftime('%Y-%m-%d %H:%M:%S') %></code>
+              <span style="font-style: italic; opacity: 0.6;">(<%= Duration.new(seconds: Time.now - w[:created]) %> ago)</span>
+            </td>
             <td>
-              <code class="text-dark"><%= w[:state_change].strftime('%Y-%m-%d %H:%M:%SZ') %></code>
+              <code class="text-dark"><%= w[:state_change].to_local.strftime('%Y-%m-%d %H:%M:%S') %></code>
               <span style="font-style: italic; opacity: 0.6;">(<%= Duration.new(seconds: Time.now - w[:state_change]) %> ago)</span>
             </td>
           </tr>
@@ -87,7 +93,7 @@
       </div>
 
       <hr/>
-      <h2>Active allocations in last 3h</h2>
+      <h2>Active allocations in last 12h</h2>
       <table class="table table-striped mb-5">
         <thead>
           <tr>
@@ -98,7 +104,8 @@
             <th>Created</th>
             <th>Queued for</th>
             <th>Running for</th>
-            <th>Last active</th>
+            <th>Last connected</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -124,7 +131,7 @@
               <code style="font-weight: bold; color: black;"><%= a[:worker_hostname] %></code>
             </td>
             <td>
-              <code class="text-dark"><%= a[:created].strftime('%Y-%m-%d %H:%M:%SZ') %></code>
+              <code class="text-dark"><%= a[:created].to_local.strftime('%Y-%m-%d %H:%M:%S') %></code>
               <span style="font-style: italic; opacity: 0.6;">
                 (<%= Duration.new(seconds: Time.now - a[:created]) %> ago)
               </span>
@@ -146,6 +153,9 @@
               <%= Duration.new(seconds: Time.now - a[:last_connect]) %> ago
               <% end %>
             </td>
+            <td>
+              <a href="/admin/sessions/<%= z[:id] %>" class="btn btn-sm btn-secondary">details</a>
+            </td>
           </tr>
           <% end %>
           <% if @allocations.empty? %>
@@ -157,43 +167,50 @@
 
       <hr/>
       <h2>Budget</h2>
-      <div class="mb-5 mt-4 row">
+      <div class="mb-4 mt-4 row">
+        <% @budgets.each do |budget| %>
         <div class="col">
           <div class="card ms-2 me-2">
             <div class="card-header">
-              <%= @budget[:name] %>
+              <%= budget[:name] %>
             </div>
             <div class="vstack card-body">
               <div class="progress">
                 <% classes = %w{progress-bar} %>
-                <% classes << 'bg-warning' if @budget[:actual] > 0.75 * @budget[:total] %>
-                <% classes << 'bg-danger' if @budget[:actual] > 0.9 * @budget[:total] %>
-                <% percent = (100 * @budget[:actual] / @budget[:total]).round.clamp(1,100) %>
-                <div class="<%= classes.join(' ') %>" role="progressbar" aria-valuenow="<%= @budget[:actual] %>" aria-valuemin="0" aria-valuemax="<%= @budget[:total] %>" style="width: <%= percent %>%;">
+                <% classes << 'bg-warning' if budget[:actual] > 0.75 * budget[:total] %>
+                <% classes << 'bg-danger' if budget[:actual] > 0.9 * budget[:total] %>
+                <% percent = (100 * budget[:actual] / budget[:total]).round.clamp(1,100) %>
+                <div class="<%= classes.join(' ') %>" role="progressbar" aria-valuenow="<%= budget[:actual] %>" aria-valuemin="0" aria-valuemax="<%= budget[:total] %>" style="width: <%= percent %>%;">
                 </div>
               </div>
               <div>
-                USD $<%= "%.02f" % [@budget[:actual]] %>
+                USD $<%= "%.02f" % [budget[:actual]] %> spent
                 <span style="font-style: italic; opacity: 0.7;">
                   /
-                  USD $<%= "%.02f" % [@budget[:total]] %>
+                  USD $<%= "%.02f" % [budget[:total]] %> budgeted
                 </span>
+                &nbsp;&nbsp;&mdash;&nbsp;
+                <%= "%.1f" % (100 * budget[:actual] / budget[:total]) %>%
               </div>
             </div>
           </div>
         </div>
+        <% end %>
+      </div>
+      <div class="mb-5 mt-4 row">
         <div class="col">
           <div class="card ms-2 me-2">
             <div class="card-header">
               Spend per quota hour
             </div>
             <div class="card-body vstack">
+              <% sbudget = @budgets.find { |b| b[:name] =~ /-fixed$/ } %>
               <% c_added_per_hour = @config.find { |c| c[:key] == 'quota_mins_added_per_hour' } %>
               <% c_eos = @config.find { |c| c[:key] == 'end_of_semester' } %>
               <% time_left = (DateTime.parse(c_eos[:value]) - DateTime.now).to_f * 24 %>
               <% tbi_quota_mins = c_added_per_hour[:value].to_f * time_left * @quotas.size %>
-              <% tgt_spend_per_qmin = @budget[:total] / (@budget[:total_quota_mins] + tbi_quota_mins) %>
-              <% spend_per_qmin = @budget[:actual] / @budget[:total_used_mins] %>
+              <% tgt_spend_per_qmin = (@budget[:total] - sbudget[:total]) / (@budget[:total_quota_mins] + tbi_quota_mins) %>
+              <% spend_per_qmin = (@budget[:actual] - sbudget[:actual]) / @budget[:total_used_mins] %>
               <div>
                 <table class="table table-sm">
                   <tr>
@@ -216,7 +233,9 @@
                     <th>Budget per quota hour</th>
                     <td>
                       <span style="font-size: 0.9em;">
-                      $<%= "%.02f" % [@budget[:total]] %> /
+                      ($<%= "%.02f" % [@budget[:total]] %> -
+                       $<%= "%.02f" % [sbudget[:total]] %>)
+                       /
                       (<%= "%.02f" % [@budget[:total_quota_mins] / 60.0] %>
                       + <%= "%.02f" % [tbi_quota_mins / 60] %>) hrs
                       </span>
@@ -226,20 +245,23 @@
                     <th>Spend per used hour</th>
                     <td>
                       <span style="font-size: 0.9em;">
-                        $<%= "%.02f" % [@budget[:actual]] %>
+                        ($<%= "%.02f" % [@budget[:actual]] %>
+                        - $<%= "%.02f" % [sbudget[:actual]] %>)
                         / <%= "%.02f" % [@budget[:total_used_mins] / 60.0] %> hrs
                       </span>
                       = <b>$<%= "%.02f" % [spend_per_qmin * 60] %></b> per hr
+                      <span style="font-style: italic; opacity: 0.6;">(<b><%= "%.1f" % [100 * spend_per_qmin / tgt_spend_per_qmin] %>%</b> of budget)</span>
                     </td>
                   </tr>
                   <tr>
                     <th>Projected max spend</th>
                     <td>
-                      <% max_spend = spend_per_qmin * (@budget[:total_quota_mins] + tbi_quota_mins) %>
+                      <% max_spend = spend_per_qmin * (@budget[:total_quota_mins] + tbi_quota_mins) + sbudget[:total] %>
                       <span style="font-size: 0.9em;">
                       $<%= "%.02f" % [spend_per_qmin * 60] %> per hr *
                       (<%= "%.02f" % [@budget[:total_quota_mins] / 60.0] %>
                       + <%= "%.02f" % [tbi_quota_mins / 60] %>) hrs
+                      + $<%= "%.02f" % [sbudget[:total]] %> fixed costs
                       </span>
                       = USD <b>$<%= "%.02f" % [max_spend] %></b></td>
                     </td>
@@ -270,6 +292,58 @@
       </div>
 
       <hr/>
+      <h2>NFS storage</h2>
+      <div class="mb-5 mt-4 row">
+        <% @nfs_servers.each do |nfs| %>
+        <div class="col">
+          <div class="card ms-2 me-2">
+            <div class="card-header">
+              <code style="color: black; font-weight: bold;"><%= nfs[:hostname] %></code> (<code><%= nfs[:ip] %></code>)
+            </div>
+            <div class="vstack card-body">
+              <div class="progress">
+                <% classes = %w{progress-bar} %>
+                <% classes << 'bg-warning' if nfs[:used_mb] > 0.75 * nfs[:total_mb] %>
+                <% classes << 'bg-danger' if nfs[:used_mb] > 0.9 * nfs[:total_mb] %>
+                <% percent = (100 * nfs[:used_mb] / nfs[:total_mb]).round.clamp(1,100) %>
+                <div class="<%= classes.join(' ') %>" role="progressbar" aria-valuenow="<%= nfs[:used_mb] %>" aria-valuemin="0" aria-valuemax="<%= nfs[:total_mb] %>" style="width: <%= percent %>%;">
+                </div>
+              </div>
+              <div class="mb-3">
+                <%= (nfs[:used_mb] / 1024.0).round(1) %> GB used
+                <span style="font-style: italic; opacity: 0.7;">
+                  /
+                  ~<%= (nfs[:total_mb] / 1024.0).round(0) %> GB approx capacity
+                </span>
+                &nbsp;&nbsp;&mdash;&nbsp;
+                <%= (100 * nfs[:used_mb] / nfs[:total_mb]).round(1) %>% used
+              </div>
+              <div class="progress">
+                <% classes = %w{progress-bar} %>
+                <% quotas_gb = @quotas.map { |q| q[:home_quota_gb] + q[:conda_quota_gb] + q[:cache_quota_gb] }.sum %>
+                <% quotas_mb = quotas_gb * 1024 %>
+                <% classes << 'bg-warning' if quotas_mb > 1.2 * nfs[:total_mb] %>
+                <% classes << 'bg-danger' if quotas_mb > 1.8 * nfs[:total_mb] %>
+                <% percent = (50 * quotas_mb / nfs[:total_mb]).round.clamp(1,100) %>
+                <div class="<%= classes.join(' ') %>" role="progressbar" aria-valuenow="<%= quotas_mb %>" aria-valuemin="0" aria-valuemax="<%= nfs[:total_mb] %>" style="width: <%= percent %>%;">
+                </div>
+              </div>
+              <div>
+                <%= (quotas_mb / 1024.0).round(0) %> GB in quotas
+                <span style="font-style: italic; opacity: 0.7;">
+                  /
+                  ~<%= (nfs[:total_mb] / 1024.0).round(0) %> GB approx capacity
+                </span>
+                &nbsp;&nbsp;&mdash;&nbsp;
+                <%= (100 * quotas_mb / nfs[:total_mb]).round(1) - 100 %>% oversubscription
+              </div>
+            </div>
+          </div>
+        </div>
+        <% end %>
+      </div>
+
+      <hr/>
       <h2>Quota</h2>
       <table class="table table-striped">
         <thead>
@@ -285,7 +359,7 @@
         </thead>
         <tbody>
           <% @quotas.each do |q| %>
-          <% rem = q[:quota_mins] - q[:used_mins] %>
+          <% rem = (q[:quota_mins] - q[:used_mins]).clamp(0, 1e9) %>
           <% time_warning = q[:used_mins] > 0.75 * q[:quota_mins] or rem < 12*60 %>
           <% time_danger = q[:used_mins] > 0.9 * q[:quota_mins] or rem < 2*60 %>
           <% rowclass = [] %>
@@ -364,7 +438,7 @@
     <script>
       const data = <%= @poolhistjson %>;
 
-      const width = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0) / 2;
+      const width = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0) * 0.8;
       const height = 200;
       const marginTop = 30, marginRight = 30, marginLeft = 40, marginBottom = 30;
 

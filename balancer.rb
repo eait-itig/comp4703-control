@@ -10,6 +10,7 @@ require 'logger'
 require 'etc'
 require 'digest'
 require 'erb'
+require 'zlib'
 require './utils'
 
 ENV['SSH_AUTH_SOCK'] = '/run/zone-auth-agent.sock'
@@ -17,6 +18,21 @@ ENV['SDC_URL'] = 'https://cloudapi.gps-1.uqcloud.net'
 ENV['SDC_KEY_ID'] = %x{ssh-add -l}.split("\n").first.split[1].strip
 ENV['SDC_ACCOUNT'] = %x{mdata-get sdc:owner_uuid}.strip
 ENV['SDC_USER'] = 'machine'
+
+class Rational
+  def self.minutes(n)
+    Rational(n, 24*60)
+  end
+  def self.seconds(n)
+    Rational(n, 24*3600)
+  end
+  def minutes(precision: 0)
+    (self * 24 * 60).to_f.round(precision)
+  end
+  def seconds(precision: 0)
+    (self * 24 * 3600).to_f.round(precision)
+  end
+end
 
 $log = Logger.new(STDERR)
 $log.level = Logger::DEBUG
@@ -127,10 +143,14 @@ class TplParams
   def get_binding
     binding
   end
-  def heredoc(fname)
+  def heredoc(fname, deflate: false)
     tpl = ERB.new(File.read("#{__dir__}/#{fname}"), trim_mode: '-')
-    delim = SecureRandom.hex(4).upcase
-    "<<\"#{delim}\"\n#{tpl.result(get_binding)}\n#{delim}\n"
+    data = tpl.result(get_binding)
+    if deflate
+      data = Base64.encode64(Zlib::Deflate.deflate(data))
+    end
+    delim = SecureRandom.hex(6).upcase
+    "<<\"#{delim}\"\n#{data}\n#{delim}\n"
   end
 end
 
@@ -142,7 +162,15 @@ def provision
     {name: 'name', values: ['Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) *']},
     {name: 'architecture', values: ['x86_64']}
   ], owners: ['amazon'])
-  img = res.images.sort_by { |i| i.creation_date }.last
+  images = res.images
+
+  res = $ec2.describe_images(filters: [
+    {name: 'name', values: ['COMP4703 Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) *']},
+    {name: 'architecture', values: ['x86_64']}
+  ], owners: ['017820696081'])
+  images += res.images
+
+  img = images.sort_by { |i| i.creation_date }.last
 
   res = $ec2.describe_vpcs(:filters => [{name: 'tag:Name', values: [$vpcname]}])
   vpc = res.vpcs.first
@@ -195,10 +223,13 @@ end
 def rebalance
   $log.info("starting rebalance")
 
+  $log.debug("update zone keys")
   update_zone_keys
 
+  $log.debug("update budgets")
   update_budgets
 
+  $log.debug('fetch AWS workers')
   # first, reconcile AWS' list of worker instances with our db
   # make sure everything is up to date
   aws_workers = {}
@@ -218,6 +249,8 @@ def rebalance
       }
     end
   end
+
+  $log.debug('fetch db workers')
   db_workers = {}
   $db.exec('select * from workers') do |res|
     res.each do |row|
@@ -233,6 +266,7 @@ def rebalance
     end
   end
 
+  $log.debug('check AWS workers are all in DB')
   # check for workers that are in EC2 but not in our DB
   # terminate these
   aws_workers.each do |wname, info|
@@ -242,6 +276,7 @@ def rebalance
     info[:inst].terminate
   end
 
+  $log.debug('check DB workers are all in AWS')
   # check for workers that are in our DB but don't exist in EC2
   # unallocate these and get rid of them
   db_workers.each do |wname, info|
@@ -280,6 +315,7 @@ def rebalance
   # go through all the open allocations and check if they can be charged to
   # quota or unallocated (due to being idle)
   allocations = Hash.new([])
+  $log.debug('updating existing allocations')
   $db.exec('select * from allocations
       where state != \'closed\' order by created asc') do |res|
     res.each do |row|
@@ -293,24 +329,32 @@ def rebalance
 
       # collect all the 'waiting' allocations for us to use in the next step
       waiting << row if row[:state] == 'waiting'
+
+      # if this is a new allocation just out of "waiting", there might be a race
+      # between us allocating it and the frontend asking to wait for it
+      # so notify anyone waiting on this alloc, just in case there's a race
       if row[:state] != 'waiting'
-        # notify anyone waiting on this alloc, just in case there's a race
-        notify_alloc(row[:id], row[:state], do_any: false)
+        allocated = row[:allocated].to_datetime
+        if DateTime.now - allocated < Rational.minutes(2)
+          notify_alloc(row[:id], row[:state], do_any: false)
+        end
       end
 
       next unless %w{allocated busy}.include?(row[:state])
 
       allocated = row[:allocated].to_datetime
-      next if DateTime.now - allocated < Rational(3, 24*60)
+      next if DateTime.now - allocated < Rational.minutes(3)
 
-      action = nil
+      action = :none
+      reason = nil
 
       # first, update quota charging for this allocation
       charged = row[:allocated].to_datetime
       charged = row[:charged_until].to_datetime if row[:charged_until]
       now = DateTime.now
-      if (now - charged) > Rational(charge_increment_mins, 24*60)
-        mins = ((now - charged) / Rational(1, 24*60)).to_i
+      if (now - charged) > Rational.minutes(charge_increment_mins)
+        mins = (now - charged).minutes
+        $log.debug("allocation #{row[:id]}: charging quota for #{mins} min")
         $db.exec('begin')
         r = $db.exec_params('update quotas
           set used_mins = used_mins + $1
@@ -326,59 +370,123 @@ def rebalance
         $db.exec('commit')
         if quota[:used_mins] > quota[:quota_mins]
           $log.info("user '#{quota[:username]}' is over quota, kicking them")
-          r = $dbssh.exec_params('select comment from users where id = $1',
-            [row[:ssh_user_id]])
-          action = :unallocate if r[0]['comment'] == 'DISABLED'
-          $dbssh.exec_params('update users
-            set comment = $1
-            where id = $2',
-            ['DISABLED', row[:ssh_user_id]])
+          action = :unallocate
+          reason = 'quota'
         end
       end
 
       # work out the last time a connection was active on this allocation
       last_active = row[:last_connect] ? row[:last_connect].to_datetime : nil
       last_connect = nil
+      connected_now = false
       r = $dbssh.exec_params('select * from sessions
         where host_id = $1 and user_id = $2',
         [row[:ssh_host_id], row[:ssh_user_id]])
       r.each do |sess|
         sess.symbolize!
-        if sess[:stopped_at].nil? and sess[:status] != 'closed'
-          last_active = DateTime.now
-          break
-        end
         created = sess[:created_at].to_datetime
         last_active = created if last_active.nil? or created > last_active
         last_connect = created if last_connect.nil? or created > last_connect
+        if sess[:stopped_at].nil? and sess[:status] != 'closed'
+          last_active = DateTime.now
+          connected_now = true
+          next
+        end
         next unless sess[:stopped_at]
         stopped = sess[:stopped_at].to_datetime
         last_active = stopped if last_active.nil? or stopped > last_active
       end
 
-      if not last_active.nil?
+      if not last_active.nil? and row[:last_connect].to_datetime != last_active
         $db.exec_params('update allocations
           set last_connect = $2
           where id = $1', [row[:id], last_active])
       end
 
-      # if the session was never connected to and it's been 15 min, kill it
-      action = :unallocate if row[:state] == 'allocated' and last_active.nil? and
-        DateTime.now - allocated > Rational(15, 24*60)
+      # find the reason for the last idle report
+      last_reason = nil
+      last_report_time = nil
+      r = $db.exec_params('select * from alloc_reports
+        where allocation_id = $1 order by time desc limit 1',
+        [row[:id]])
+      last_report_time = r[0]['time'].to_datetime if r.ntuples > 0
+      last_reason = r[0]['reason'] if r.ntuples > 0
 
-      # if the session is idle and the last active connection was >10 min ago, kill it
-      action = :unallocate if row[:state] == 'allocated' and last_active and
-        DateTime.now - last_active > Rational(10, 24*60)
+      # if the session was never connected to and it's been 5 min, kill it
+      if row[:state] == 'allocated' and last_active.nil? and
+          (DateTime.now - allocated) > Rational.minutes(5)
+        action = :unallocate
+        reason = 'never-connected'
+      end
 
-      # if the session is idle and the last connection start was >15 min ago, kill it
-      action = :unallocate if row[:state] == 'allocated' and last_connect and
-        DateTime.now - last_connect > Rational(15, 24*60)
+      # if the session is idle and the last active connection was >15 min ago, kill it
+      if row[:state] == 'allocated' and last_active and
+          (DateTime.now - last_active) > Rational.minutes(15)
+        action = :unallocate
+        reason = 'idle-15m'
+      end
+
+      # if the session is disconnected and was idled due to no processes, and it's been 5 min, kill it
+      if row[:state] == 'allocated' and not connected_now and
+          last_reason == 'no-processes' and last_active and
+          (DateTime.now - last_active) > Rational.minutes(5)
+        action = :unallocate
+        reason = 'noproc-5m'
+      end
+
+      # if the session is idle, connected, and last connection start was >30 min ago, kill it
+      if row[:state] == 'allocated' and connected_now and
+          last_connect and (DateTime.now - last_connect) > Rational.minutes(30)
+        action = :unallocate
+        reason = 'idle-connected-30m'
+      end
+
+      # if we're not getting any status reports, that's broken
+      if (last_report_time.nil? and (DateTime.now - allocated) > Rational.minutes(30)) or
+          (last_report_time and (DateTime.now - last_report_time) > Rational.minutes(30))
+        action = :unallocate
+        reason = 'report-broken'
+      end
 
       # maximum job limit: 5 days
-      action = :unallocate if row[:state] == 'busy' and
-        DateTime.now - allocated > Rational(5, 1)
+      if (DateTime.now - allocated) > Rational(5, 1)
+        action = :unallocate
+        reason = 'max-session-time'
+      end
+
+      $log.debug("allocation #{row[:id]}: #{row[:state]}, " +
+        (connected_now ? 'connected, ' : '') +
+        "allocated = #{(DateTime.now - allocated).minutes}m ago, " +
+        "last_active = #{last_active ? (DateTime.now - last_active).minutes : '??'}m ago, " +
+        "last_connect = #{last_connect ? (DateTime.now - last_connect).minutes : '??'}m ago, " +
+        "last_reason = #{last_reason.inspect}: " +
+        "action = #{action} (#{reason})")
 
       if action == :unallocate
+        if not reason.nil?
+          $db.exec_params('insert into alloc_reports (allocation_id, time, type, reason)
+            values ($1, now(), \'killed\', $2)', [row[:id], reason])
+        end
+
+        $log.debug("disconnecting clients under allocation #{row[:id]}")
+
+        # attempt a nice disconnect straight away
+        t0 = Time.now
+        while connected_now and (Time.now - t0) < 10
+          $dbssh.exec_params('update users
+            set comment = $1
+            where id = $2',
+            ['DISABLED', row[:ssh_user_id]])
+
+          sleep 1
+
+          r = $dbssh.exec_params('select * from sessions
+            where host_id = $1 and user_id = $2
+            and stopped_at is null and status != \'closed\'',
+            [row[:ssh_host_id], row[:ssh_user_id]])
+          connected_now = (r.ntuples > 0)
+        end
+
         unallocate row[:id]
         worker = db_workers[row[:worker_hostname]]
         states[worker[:state].to_sym] -= 1
@@ -388,6 +496,7 @@ def rebalance
     end
   end
 
+  $log.debug('assigning to spares')
   # assign any waiting allocations to spares if we have them
   while not waiting.empty? and states[:ready] > 0
     alloc = waiting.shift
@@ -399,6 +508,7 @@ def rebalance
     allocate alloc[:id], wname
   end
 
+  $log.debug('computing pool size')
   pool_max = get_config(:pool_max).to_i
   pool_spares = get_config(:pool_spares).to_i
   pool_idle_mins = get_config(:pool_idle_mins).to_i
@@ -411,14 +521,27 @@ def rebalance
   limit = pool_max - total
   want = limit if want > limit
 
-  r = $db.exec_params('select * from pool_size_history where time > $1',
+  # use the pool size history to stop the pool from shrinking too quickly
+  # we're ok with growing fast, but we want shrinking to happen slowly
+  # (this makes sure we have room to re-use nodes and keeps queue time down)
+  r = $db.exec_params('select * from pool_size_history where time > $1 order by time asc',
     [Time.now - 3*3600])
-  min_size = 1
+  min_size = 0
+  last_total = nil
   r.each do |sample|
     sample.symbolize!
     busy = sample[:total] - sample[:spares]
+
+    # for samples in last pool_idle_mins window, use busy + new/current spares
     nmin_size = (busy + pool_spares - ((Time.now - sample[:time]) / 60.0) / pool_idle_mins.to_f).ceil
     min_size = nmin_size if nmin_size > min_size
+
+    next if sample[:total] == last_total
+    if last_total.nil? or sample[:total] > last_total
+      nmin_size = (sample[:total] - ((Time.now - sample[:time]) / 60.0) / pool_idle_mins.to_f).ceil
+      min_size = nmin_size if nmin_size > min_size
+    end
+    last_total = sample[:total]
   end
 
   $db.exec_params('insert into pool_size_history (total, spares)
@@ -434,6 +557,7 @@ def rebalance
   # provision new instances!
   want.times { provision }
 
+  $log.debug('checking for idle spares to terminate')
   # finally, check for any extra idle spares we can terminate
   if states[:ready] > pool_spares and states[:all] > min_size
     db_workers.each do |hostname, info|
@@ -444,7 +568,7 @@ def rebalance
       lastclose = r[0]['lastclose']
       if not lastclose.nil?
         lastclose = lastclose.to_datetime
-        next if (DateTime.now - lastclose) < Rational(pool_idle_mins, 24*60)
+        next if (DateTime.now - lastclose) < Rational.minutes(pool_idle_mins)
       end
 
       r = $db.exec_params('select max(allocated) as lastalloc from allocations
@@ -452,7 +576,7 @@ def rebalance
       lastalloc = r[0]['lastalloc']
       if not lastalloc.nil?
         lastalloc = lastalloc.to_datetime
-        next if (DateTime.now - lastclose) < Rational(5, 24*60)
+        next if (DateTime.now - lastclose) < Rational.minutes(5)
       end
 
       $log.info("terminating idle spare #{hostname}")
@@ -472,34 +596,38 @@ end
 
 def notify_alloc(alloc_id, state, do_any: true)
   wsocks = $alloc_sockmap[alloc_id].reject { |s| s.closed? }
-  r = IO.select([], wsocks, [], 1)
-  if not r.nil?
-    _, socks, _ = r
-    socks.each do |sock|
-      begin
-        sock.puts JSON.dump({
-          :status => :ok,
-          :allocation => alloc_id,
-          :state => state
-        })
-      rescue Exception
+  if wsocks.size > 0
+    r = IO.select([], wsocks, [], 1)
+    if not r.nil?
+      _, socks, _ = r
+      socks.each do |sock|
+        begin
+          sock.puts JSON.dump({
+            :status => :ok,
+            :allocation => alloc_id,
+            :state => state
+          })
+        rescue Exception
+        end
       end
     end
   end
   $alloc_sockmap.delete(alloc_id)
   return unless do_any
   wsocks = $alloc_sockmap[:any].reject { |s| s.closed? }
-  r = IO.select([], wsocks, [], 1)
-  if not r.nil?
-    _, socks, _ = r
-    socks.each do |sock|
-      begin
-        sock.puts JSON.dump({
-          :status => :ok,
-          :allocation => alloc_id,
-          :state => state
-        })
-      rescue Exception
+  if wsocks.size > 0
+    r = IO.select([], wsocks, [], 1)
+    if not r.nil?
+      _, socks, _ = r
+      socks.each do |sock|
+        begin
+          sock.puts JSON.dump({
+            :status => :ok,
+            :allocation => alloc_id,
+            :state => state
+          })
+        rescue Exception
+        end
       end
     end
   end
@@ -510,18 +638,37 @@ def unallocate(alloc_id)
   r = $db.exec_params('select * from allocations where id = $1', [alloc_id])
   alloc = r[0].symbolize
 
+  last_reason = nil
+  r = $db.exec_params('select * from alloc_reports
+    where allocation_id = $1 order by time desc limit 1',
+    [alloc_id])
+  last_reason = r[0]['reason'] if r.ntuples > 0
+
   $dbssh.exec('begin');
   $db.exec('begin');
+
   now = DateTime.now
-  charged = alloc[:allocated].to_datetime
+  allocated = alloc[:allocated].to_datetime
+  last_charged = allocated
   if alloc[:charged_until]
-    charged = alloc[:charged_until].to_datetime
+    last_charged = alloc[:charged_until].to_datetime
   end
-  mins = ((now - charged) / Rational(1, 24*60)).to_i
+  charged_mins = (last_charged - allocated).minutes
+  total_mins = (now - allocated).minutes
+  total_mins = 0 if total_mins < 5
+  if last_reason == 'noproc-5m'
+    total_mins = (total_mins - 5).clamp(0, total_mins)
+  elsif last_reason == 'idle-15m'
+    total_mins = (total_mins - 15).clamp(0, total_mins)
+  elsif last_reason == 'report-broken'
+    total_mins = 0
+  end
+  to_charge = total_mins - charged_mins
+
   r = $db.exec_params('update quotas
     set used_mins = used_mins + $1
     where username = (select coalesce(owner,\'\') from zones where id = $2)
-    returning used_mins, quota_mins', [mins, alloc[:zone_id]])
+    returning used_mins, quota_mins', [to_charge, alloc[:zone_id]])
   $db.exec_params('update allocations
     set charged_until = $2
     where id = $1', [alloc_id, now])
@@ -681,19 +828,19 @@ File.chmod(0660, $sockpath)
 $log.info("listening on #{$sockpath}")
 
 socks = []
+last_rebal = Time.now
 loop do
-  need_rebal = false
+  need_rebal = ((Time.now - last_rebal) > 30)
   socks = socks.select { |s| not s.closed? }
   ret = IO.select(socks + [listensock], [], [], 10)
   if ret.nil?
     rebalance
+    last_rebal = Time.now
     next
   end
   rs, _ws, errs = ret
   if rs.include?(listensock)
     sock = listensock.accept
-    uid, gid = sock.getpeereid
-    $log.info("accepted connection #{sock} from #{uid}:#{gid}")
     socks << sock
   end
   rs.each do |sock|
@@ -733,5 +880,8 @@ loop do
       sock.puts(JSON.dump({:status => :error, :reason => 'Invalid operation'}))
     end
   end
-  rebalance if need_rebal
+  if need_rebal
+    last_rebal = Time.now
+    rebalance
+  end
 end

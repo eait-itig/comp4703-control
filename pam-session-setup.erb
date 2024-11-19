@@ -90,7 +90,7 @@ if not File.exist?('/etc/zoneid') or File.new('/etc/zoneid').read.strip != zid
   sh("pkill -U #{User}", check: false)
 
   $log.info 'cleaning up scratch space'
-  sh("rm -fr /tmp/inst/#{User} /var/tmp/inst/#{User} /opt/nvme/inst/#{User}")
+  sh("rm -fr /tmp/inst/#{User} /var/tmp/inst/#{User} /opt/nvme/{,tmp-,vtmp-}inst/#{User}")
 
   $log.info 'deleting nonidle stamp'
   sh("rm -fr #{NONIDLE_STAMP}")
@@ -107,6 +107,15 @@ if not File.exist?('/etc/zoneid') or File.new('/etc/zoneid').read.strip != zid
   f = File.new('/etc/zoneid', 'w')
   f.puts zid
   f.close
+
+  $log.info('changing accounting file')
+  pacct = "/var/log/account/pacct.#{zid}"
+  sh("rm -f #{pacct}")
+  sh("touch #{pacct}")
+  sh("accton #{pacct}")
+
+  $log.info('removing old idle-procs file')
+  sh("rm -f /run/idle-procs.#{zid}")
 end
 
 exit 0 if not owner

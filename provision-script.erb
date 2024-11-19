@@ -16,37 +16,66 @@ for x in docker.service containerd.service snapd.service docker.socket snapd.soc
   systemctl disable ${x}
 done
 
-echo 'AuthorizedKeysFile /etc/ssh/authorized_keys/%u' >>/etc/ssh/sshd_config
-mkdir /etc/ssh/authorized_keys
+if ! grep '/etc/ssh/authorized_keys/%u' /etc/ssh/sshd_config >/dev/null; then
+  echo 'AuthorizedKeysFile /etc/ssh/authorized_keys/%u' >>/etc/ssh/sshd_config
+fi
+mkdir -p /etc/ssh/authorized_keys
 echo '<%= @default_pubkey %>' >/etc/ssh/authorized_keys/root
 echo '<%= @default_pubkey %>' >/etc/ssh/authorized_keys/comp4703
 systemctl restart ssh
 
 # xusers
-groupadd xusers
+getent group xusers >/dev/null || groupadd xusers
 for user in <%= @xusers.join(' ') %>; do
-  useradd -g xusers -s /bin/bash -m ${user}
+  getent passwd ${user} >/dev/null || useradd -g xusers -s /bin/bash -m ${user}
   mkdir -p /home/${user}/.ssh
+  chown ${user} /home/${user}/.ssh
   curl -o /etc/ssh/authorized_keys/${user} https://internal.eait.uq.edu.au/api/sshkeys.php/${user}
 done
-echo "%xusers ALL=(ALL) NOPASSWD: ALL" | tee -a /etc/sudoers
+if ! grep xusers /etc/sudoers >/dev/null; then
+  echo "%xusers ALL=(ALL) NOPASSWD: ALL" | tee -a /etc/sudoers
+fi
 
 # delete the default ubuntu user
-userdel -fr ubuntu
+getent passwd ubuntu && userdel -fr ubuntu
+
+# turn off the man-db regen after installing packages, it takes ages
+rm -f /var/lib/man-db/auto-update
+# don't update libc, it takes ages too
+apt-mark hold libc-bin
+export DEBIAN_FRONTEND=noninteractive
+
+# really, unattended-upgrades, bugger off
+pkill -f unattended || true
+pkill -f apt-get || true
+pkill -f dpkg || true
 
 # basic packages
-apt-get update
-#apt-get upgrade -y
-apt-get install -y nodejs npm diod munge ruby cachefilesd
-npm install -g sshpk
+# start this in the background while we set up our auth key, we'll wait for it
+# before we go to use these packages
+if [ ! -x /usr/sbin/diod ] || [ ! -x /usr/bin/munge ] || [ ! -x /usr/bin/ruby ]; then
+  (apt-get update; apt-get install -yq diod munge ruby cachefilesd acct fio) &
+ fi
+
+# install node.js
+if [ ! -x /usr/local/bin/node ]; then
+  curl https://nodejs.org/download/release/v20.18.0/node-v20.18.0-linux-x64.tar.xz \
+    | tar --strip-components=1 -C/usr/local -Jxf -
+fi
+
+if [ ! -x /usr/local/bin/sshpk-tool ]; then
+  npm install -g sshpk
+fi
 
 # npm refuses to install from git+https now
-cd /usr/local/lib
-git clone https://github.com/eait-itig/node-smartdc-auth
-cd node-smartdc-auth
-npm install
-npm install -g .
-chmod -R a+rX /usr/local/lib/node-smartdc-auth
+if [ ! -d /usr/local/lib/node-smartdc-auth ]; then
+  cd /usr/local/lib
+  git clone https://github.com/eait-itig/node-smartdc-auth
+  cd node-smartdc-auth
+  npm install
+  npm install -g .
+  chmod -R a+rX /usr/local/lib/node-smartdc-auth
+fi
 
 # set up auth key
 mkdir -p /var/lib/auth-keys/keys
@@ -88,7 +117,13 @@ groupadd -g 1000 comp4703
 useradd -u 1000 -g comp4703 -G plugdev,video -s /bin/bash comp4703
 mkdir /home/comp4703
 
-cat >/usr/local/sbin/idle-session-check <%= heredoc 'idle-session-check.erb' %>
+# now wait for the apt-get commands we started earlier
+wait
+
+deflater() {
+  ruby -e 'require "zlib"; require "base64"; STDOUT.write Zlib::Inflate.inflate(Base64.decode64(STDIN.read)); exit 0'
+}
+deflater >/usr/local/sbin/idle-session-check <%= heredoc 'idle-session-check.erb', deflate: true %>
 chmod a+x /usr/local/sbin/idle-session-check
 
 cat >/etc/systemd/system/idle-session-check.service <<EOF
@@ -99,6 +134,8 @@ Wants=idle-session-check.timer
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/idle-session-check
+Restart=on-failure
+RestartSec=30
 EOF
 
 cat >/etc/systemd/system/idle-session-check.timer <<EOF
@@ -119,14 +156,14 @@ systemctl daemon-reload
 systemctl enable idle-session-check.timer
 systemctl start idle-session-check.timer
 
-cat >/usr/local/sbin/pam-session-setup <%= heredoc 'pam-session-setup.erb' %>
+deflater >/usr/local/sbin/pam-session-setup <%= heredoc 'pam-session-setup.erb', deflate: true %>
 chmod a+x /usr/local/sbin/pam-session-setup
 
 cat >>/etc/security/namespace.conf <<EOF
-/tmp              /tmp/inst/            user  root,<%= @xusers.join(',') %>
-/var/tmp          /var/tmp/inst/        user  root,<%= @xusers.join(',') %>
-/dev/shm          /dev/shm/inst/        tmpfs:mntopts=nosuid,nodev,size=2g    root,<%= @xusers.join(',') %>
-/opt/dlami/nvme   /opt/dlami/nvme/inst/ user  root,<%= @xusers.join(',') %>
+/tmp              /opt/dlami/nvme/tmp-inst/     user  root,<%= @xusers.join(',') %>
+/var/tmp          /opt/dlami/nvme/vtmp-inst/    user  root,<%= @xusers.join(',') %>
+/dev/shm          /dev/shm/inst/                tmpfs:mntopts=nosuid,nodev,size=2g    root,<%= @xusers.join(',') %>
+/opt/dlami/nvme   /opt/dlami/nvme/inst/         user  root,<%= @xusers.join(',') %>
 EOF
 cat >>/etc/pam.d/common-session <<EOF
 session required        pam_namespace.so
@@ -151,9 +188,6 @@ RUN=yes
 EOF
 systemctl enable cachefilesd
 systemctl restart cachefilesd
-
-systemctl enable rpc-statd.service
-systemctl start rpc-statd.service
 
 ln -s /opt/dlami/nvme /scratch
 mkdir -p /conda

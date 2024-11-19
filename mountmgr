@@ -1,0 +1,102 @@
+#!/usr/bin/ruby
+require 'json'
+require 'tempfile'
+require 'logger'
+require 'open3'
+
+LOCK_FILE = '/run/mountmgr.lock'
+LOG_FILE = '/var/log/mountmgr.log'
+
+ENV['PATH'] = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+ENV['SSH_AUTH_SOCK'] = '/var/lib/auth-keys/sockets/default'
+ENV['SDC_KEY_ID'] = %x{ssh-add -l}.split[1]
+ENV['SDC_ACCOUNT'] = %x{hostname}.strip
+
+def sh(cmd, input: nil, check: true)
+  $log.info("CMD: #{cmd}")
+  $logfile.flush
+  outlines = []
+  Open3.popen3(cmd) do |stdin, stdout, stderr, waiter|
+    stdin.write(input) if not input.nil?
+    stdin.close
+    fds = [stdout, stderr]
+    loop do
+      rs, _, _ = IO.select(fds)
+      rs.each do |fd|
+        if fd.eof?
+          fds.delete(fd)
+          next
+        end
+        line = fd.readline.chomp
+        if fd == stdout and line != ''
+          outlines << line
+          $log.info('> ' + line)
+        elsif fd == stderr
+          $log.error('> ' + line)
+        end
+      end
+      break if fds.empty?
+    end
+    exit_status = waiter.value
+    if exit_status != 0 and check
+      raise Exception.new("Command '#{cmd}' exited with status #{exit_status}")
+    end
+  end
+  outlines
+end
+
+$lock = File.open(LOCK_FILE, File::CREAT)
+$lock.flock(File::LOCK_EX)
+
+#$logfile = File.open(LOG_FILE, File::WRONLY | File::APPEND | File::CREAT | File::SYNC)
+$logfile = STDERR
+$log = Logger.new($logfile)
+$log.level = Logger::DEBUG
+
+digest = nil
+
+loop do
+  uri = 'https://comp4703-control.uqcloud.net/nfs/exports'
+  uri += "/#{digest}" if digest
+  $log.debug("requesting #{uri}")
+  obj = nil
+  begin
+    data = sh("sdc-curl -s #{uri}")
+    obj = JSON.parse(data.join("\n"), :symbolize_names => true)
+  rescue Exception
+    sleep 1
+    next
+  end
+  next unless obj[:digest]
+  next if digest == obj[:digest]
+  digest = obj[:digest]
+  $log.debug("digest is now #{digest}")
+
+  oldf = File.new('/etc/exports')
+  newf = Tempfile.new('.exports', '/etc')
+  until oldf.eof?
+    line = oldf.readline
+    if line =~ /^\s*#/
+      newf.puts line
+    elsif line =~ /^\s*#\s*KEEP/
+      newf.puts line
+      newf.puts oldf.readline
+    end
+  end
+  oldf.close
+  obj[:mounts].each do |mount|
+    newf.puts "/storage/home/#{mount[:username]}\t\t#{mount[:mountip]}/32(rw,sync,crossmnt)"
+    newf.puts "/storage/conda/#{mount[:username]}\t\t#{mount[:mountip]}/32(rw,sync,crossmnt)"
+    newf.puts "/storage/cache/#{mount[:username]}\t\t#{mount[:mountip]}/32(rw,sync,crossmnt)"
+  end
+  newf.chmod(0644)
+  newf.close
+
+  diff = %x{diff -u /etc/exports #{newf.path}}
+  $log.debug("diff = #{diff}")
+
+  File.rename(newf.path, '/etc/exports')
+  $log.debug("rebuilt exports")
+
+  sh('exportfs -ra')
+end

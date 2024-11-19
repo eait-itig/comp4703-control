@@ -1,15 +1,13 @@
 #!/usr/bin/ruby
 ENV['TZ'] = 'Australia/Brisbane'
 now = Time.now
-if now.hour >= 1 and now.hour <= 8
-  spares = 1
-elsif now.hour >= 1 and now.hour <= 10 and now.sunday?
-  spares = 1
-elsif now.hour >= 13 and now.hour <= 16 and (now.monday? or now.tuesday?)
-  spares = 3
-else
-  spares = 2
-end
+#if now.hour >= 0 and now.hour <= 8
+  spares = 0
+#elsif now.hour >= 9 and now.hour <= 10 and now.sunday?
+#  spares = 0
+#else
+#  spares = 1
+#end
 out = nil
 IO.popen('psql control', 'r+') do |p|
   p.puts("update config set value = '#{spares}' where key = 'pool_spares';")
